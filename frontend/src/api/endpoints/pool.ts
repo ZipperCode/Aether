@@ -163,6 +163,11 @@ export interface PoolKeyDetail {
   auto_fetch_models?: boolean
   last_models_fetch_at?: number | null
   last_models_fetch_error?: string | null
+  codex_model_catalog_ready?: boolean
+  last_inference_rejection?: {
+    observed_at: number
+    retry_at: number
+  } | null
   locked_models?: string[] | null
   model_include_patterns?: string[] | null
   model_exclude_patterns?: string[] | null

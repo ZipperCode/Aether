@@ -6,15 +6,17 @@ mod strategy;
 mod transport;
 
 pub use association_sync::{
-    global_model_matches_allowed_models, provider_model_matches_discovered_model,
-    reconcile_provider_model_whitelist_availability, sync_provider_model_discovery_associations,
-    sync_provider_model_whitelist_associations, ModelFetchAssociationStore,
+    ensure_discovered_global_models, global_model_matches_allowed_models,
+    provider_model_matches_discovered_model, reconcile_provider_model_whitelist_availability,
+    sync_provider_model_discovery_associations, sync_provider_model_whitelist_associations,
+    ModelFetchAssociationStore,
 };
 pub use codex::{
     load_codex_image_models, supplement_codex_management_models, CODEX_IMAGE_API_FORMAT,
 };
 pub use config::{
     model_fetch_interval_minutes, model_fetch_startup_delay_seconds, model_fetch_startup_enabled,
+    pool_auto_publish_discovered_models_enabled,
 };
 pub use logic::{
     aggregate_models_for_cache, apply_model_filters, build_models_fetch_url,

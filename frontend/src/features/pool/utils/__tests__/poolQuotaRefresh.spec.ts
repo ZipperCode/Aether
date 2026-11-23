@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest'
 
 import type { PoolKeyDetail } from '@/api/endpoints/pool'
 import type { RefreshQuotaResult } from '@/api/endpoints/keys'
-import { mergePoolKeyQuotaSnapshots } from '@/features/pool/utils/poolQuotaRefresh'
+import {
+  isRuntimeQuotaExhaustedPoolKey,
+  mergePoolKeyQuotaSnapshots,
+  shouldReloadPoolPageAfterQuotaRefresh,
+} from '@/features/pool/utils/poolQuotaRefresh'
 
 function createKey(keyId: string): PoolKeyDetail {
   return {
@@ -89,5 +93,85 @@ describe('mergePoolKeyQuotaSnapshots', () => {
     expect(merged[1].status_snapshot?.quota.code).toBe('unknown')
     expect(merged[1].quota_updated_at).toBe(456)
     expect(merged[2]).toBe(keys[2])
+  })
+})
+
+describe('shouldReloadPoolPageAfterQuotaRefresh', () => {
+  it('detects runtime quota_exhausted only for Codex and Antigravity rows', () => {
+    const codexBlocked = createKey('codex-blocked')
+    codexBlocked.provider_type = 'codex'
+    codexBlocked.status_snapshot = {
+      oauth: { code: 'valid' },
+      account: { code: 'ok', blocked: false },
+      quota: { code: 'ok', exhausted: false },
+      scheduling: { code: 'quota_exhausted', blocked: true, requires_manual_recovery: true },
+    }
+
+    const antigravityBlocked = createKey('ag-blocked')
+    antigravityBlocked.scheduling_reason = 'key_quota_exhausted'
+
+    const claudeBlocked = createKey('claude-blocked')
+    claudeBlocked.provider_type = 'claude_code'
+    claudeBlocked.status_snapshot = {
+      oauth: { code: 'valid' },
+      account: { code: 'ok', blocked: false },
+      quota: { code: 'ok', exhausted: false },
+      scheduling: { code: 'quota_exhausted', blocked: true },
+    }
+
+    const codexZeroPercentUnblocked = createKey('codex-unblocked')
+    codexZeroPercentUnblocked.provider_type = 'codex'
+    codexZeroPercentUnblocked.status_snapshot = {
+      oauth: { code: 'valid' },
+      account: { code: 'ok', blocked: false },
+      quota: {
+        code: 'ok',
+        exhausted: false,
+        windows: [{ code: '5h', remaining_ratio: 0 }],
+      },
+    }
+
+    expect(isRuntimeQuotaExhaustedPoolKey(codexBlocked)).toBe(true)
+    expect(isRuntimeQuotaExhaustedPoolKey(antigravityBlocked, 'antigravity')).toBe(true)
+    expect(isRuntimeQuotaExhaustedPoolKey(claudeBlocked)).toBe(false)
+    expect(isRuntimeQuotaExhaustedPoolKey(codexZeroPercentUnblocked)).toBe(false)
+  })
+
+  it('reloads for refreshed runtime quota_exhausted Codex/Antigravity rows regardless of quota percent', () => {
+    const blocked = createKey('codex-blocked')
+    blocked.status_snapshot = {
+      oauth: { code: 'valid' },
+      account: { code: 'ok', blocked: false },
+      quota: { code: 'exhausted', exhausted: true },
+      scheduling: { code: 'quota_exhausted', blocked: true },
+    }
+    const unblocked = createKey('codex-unblocked')
+
+    expect(shouldReloadPoolPageAfterQuotaRefresh([blocked, unblocked], [{
+      key_id: 'codex-blocked',
+      key_name: 'codex-blocked',
+      status: 'success',
+      quota_snapshot: {
+        code: 'ok',
+        exhausted: false,
+        windows: [{ code: '5h', remaining_ratio: 0 }],
+      },
+    }], 'codex')).toBe(true)
+
+    expect(shouldReloadPoolPageAfterQuotaRefresh([blocked, unblocked], [{
+      key_id: 'codex-blocked',
+      key_name: 'codex-blocked',
+      status: 'error',
+      message: 'upstream timeout',
+    }], 'codex')).toBe(false)
+
+    expect(shouldReloadPoolPageAfterQuotaRefresh([blocked, unblocked], [{
+      key_id: 'codex-unblocked',
+      key_name: 'codex-unblocked',
+      status: 'success',
+      quota_snapshot: { code: 'ok', exhausted: false },
+    }], 'codex')).toBe(false)
+
+    expect(shouldReloadPoolPageAfterQuotaRefresh([blocked], [], 'codex', ['codex-blocked'])).toBe(true)
   })
 })

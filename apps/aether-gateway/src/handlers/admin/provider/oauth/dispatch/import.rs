@@ -10,7 +10,7 @@ use super::super::provisioning::{
 };
 use super::super::runtime::{
     resolve_provider_oauth_runtime_endpoints,
-    spawn_provider_oauth_account_state_refresh_after_update,
+    spawn_provider_oauth_account_state_refresh_after_persistence,
 };
 use super::super::state::{
     admin_provider_oauth_template, build_admin_provider_oauth_backend_unavailable_response,
@@ -1233,11 +1233,12 @@ pub(super) async fn handle_admin_provider_oauth_import_refresh_token(
     };
     release_codex_agent_identity_enrollment(state, agent_identity_enrollment).await;
 
-    spawn_provider_oauth_account_state_refresh_after_update(
+    spawn_provider_oauth_account_state_refresh_after_persistence(
         state.cloned_app(),
         provider.clone(),
         persisted_key.id.clone(),
         request_proxy.clone(),
+        replaced,
     );
 
     if !agent_identity_task_ready {

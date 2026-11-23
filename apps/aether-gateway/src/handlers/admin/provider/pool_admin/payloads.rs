@@ -1154,10 +1154,13 @@ pub(super) fn build_admin_pool_key_payload(
     codex_cycle_usage_by_code: Option<&BTreeMap<String, StoredProviderApiKeyWindowUsageSummary>>,
     now_unix_secs: u64,
 ) -> serde_json::Value {
-    let cooldown_reason = runtime
-        .cooldown_reason_by_key
-        .get(&key.id)
-        .map(|_| "Provider key is cooling down".to_string());
+    let cooldown_reason = runtime.cooldown_reason_by_key.get(&key.id).map(|reason| {
+        if provider_type.eq_ignore_ascii_case("antigravity") && reason == "forbidden_403" {
+            reason.clone()
+        } else {
+            "Provider key is cooling down".to_string()
+        }
+    });
     let cooldown_ttl_seconds = cooldown_reason
         .as_ref()
         .and_then(|_| runtime.cooldown_ttl_by_key.get(&key.id).copied());
@@ -1283,6 +1286,35 @@ pub(super) fn build_admin_pool_key_payload(
     payload.insert("key_name".to_string(), json!(key.name));
     payload.insert("is_active".to_string(), json!(key.is_active));
     payload.insert("auth_type".to_string(), json!(key.auth_type));
+    if provider_type.eq_ignore_ascii_case("codex") && key.auth_type.eq_ignore_ascii_case("oauth") {
+        payload.insert(
+            "codex_model_catalog_ready".to_string(),
+            json!(aether_provider_transport::codex_oauth_model_catalog_ready(
+                key.upstream_metadata.as_ref()
+            )),
+        );
+    }
+    if provider_type.eq_ignore_ascii_case("antigravity") {
+        if let Some(rejection) = key
+            .status_snapshot
+            .as_ref()
+            .and_then(|s| s.get("last_inference_rejection"))
+        {
+            if let (Some(observed_at), Some(retry_at)) = (
+                rejection
+                    .get("observed_at")
+                    .and_then(serde_json::Value::as_u64),
+                rejection
+                    .get("retry_at")
+                    .and_then(serde_json::Value::as_u64),
+            ) {
+                payload.insert(
+                    "last_inference_rejection".to_string(),
+                    json!({ "observed_at": observed_at, "retry_at": retry_at }),
+                );
+            }
+        }
+    }
     payload.insert(
         "auth_type_by_format".to_string(),
         json!(key.auth_type_by_format),

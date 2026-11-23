@@ -20,4 +20,5 @@ pub(crate) use self::writes::{
     admin_provider_pool_key_terminal_error_reason, parse_google_quota_cooldown_seconds_at,
     parse_retry_after_seconds, record_admin_provider_pool_error,
     record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
+    record_pool_forbidden_cooldown,
 };

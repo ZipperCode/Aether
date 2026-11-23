@@ -1,7 +1,7 @@
 <template>
   <div
-    class="flex gap-0.5"
-    :class="layout === 'desktop' ? 'justify-center' : 'items-center'"
+    class="flex flex-wrap items-center gap-0.5"
+    :class="layout === 'desktop' ? 'justify-center' : ''"
   >
     <div
       v-for="actionId in actionIds"

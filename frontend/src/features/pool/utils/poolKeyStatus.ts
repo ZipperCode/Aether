@@ -5,14 +5,19 @@ import type { PoolMobileTagItem, PoolMobileTagTone } from '@/features/pool/utils
 import { getOAuthOrgBadge } from '@/features/providers/utils/oauthIdentity'
 import { formatOAuthPlanType } from '@/features/providers/utils/oauthPlanType'
 import { resolveAntigravityAccountTierLabel } from '@/features/providers/utils/antigravityQuota'
-import { getProviderAuthLabel } from '@/features/providers/utils/providerKeyAuth'
+import { getProviderAuthLabel, isOAuthManagedCredential } from '@/features/providers/utils/providerKeyAuth'
 import {
   getAccountStatusDisplay,
   getOAuthRefreshButtonTitle as resolveOAuthRefreshButtonTitle,
   getOAuthStatusDisplayWithFallback,
   getOAuthStatusTitle as resolveOAuthStatusTitle,
 } from '@/features/providers/utils/providerKeyStatus'
-import { getLegacyAccountQuotaText } from '@/features/providers/utils/providerKeyQuota'
+import {
+  getLegacyAccountQuotaText,
+  getQuotaExhaustedSchedulingHint,
+  getQuotaExhaustedSchedulingLabel,
+  isRecoverableRuntimeQuotaHold,
+} from '@/features/providers/utils/providerKeyQuota'
 import { getQuotaSnapshot, resolvePoolKeyPlanType } from './poolKeyQuotaProgress'
 
 export type PoolKeyScore = NonNullable<PoolKeyDetail['pool_score']>
@@ -200,16 +205,227 @@ function getKnownSchedulingLabel(code: string | null | undefined): string | null
   return key ? translate(key) : null
 }
 
-export function getSchedulingBadgeLabel(key: PoolKeyDetail, tick: number): string {
+function resolvePoolKeyProviderType(key: PoolKeyDetail, providerType?: string | null): string {
+  return String(providerType || key.provider_type || key.status_snapshot?.quota?.provider_type || '').trim().toLowerCase()
+}
+
+function isQuotaExhaustedSchedulingCode(code: string | null | undefined): boolean {
+  const normalized = String(code || '').trim().toLowerCase()
+  return normalized === 'key_quota_exhausted' || normalized === 'quota_exhausted'
+}
+
+function isAntigravityProvider(providerType?: string | null): boolean {
+  return String(providerType || '').trim().toLowerCase() === 'antigravity'
+}
+
+function isCodexOAuthKey(key: PoolKeyDetail, providerType?: string | null): boolean {
+  if (String(providerType || '').trim().toLowerCase() !== 'codex') return false
+  const authType = String(key.auth_type || '').trim().toLowerCase()
+  return authType === 'oauth' || isOAuthManagedCredential(key)
+}
+
+function isAntigravityInferenceRejectionCooldown(
+  key: PoolKeyDetail,
+  providerType?: string | null,
+  tick = 0,
+): boolean {
+  if (!isAntigravityProvider(providerType)) return false
+  if (key.cooldown_reason !== 'forbidden_403') return false
+  if (!key.is_active) return false
+  if (getAccountAlertLabel(key)) return false
+  if (getBlockingOAuthStatusLabel(key, tick)) return false
+  const visibleReason = getVisibleSchedulingReason(key)
+  return visibleReason !== 'manual_disabled' && visibleReason !== 'inactive'
+}
+
+
+export interface PoolKeyModelFetchDisplay {
+  modelFetchLabel: string
+  modelFetchClass: string
+  modelFetchTitle: string
+  modelFetchHint: string
+}
+
+export function getPoolKeyModelFetchDisplay(
+  key: PoolKeyDetail,
+  providerType?: string | null,
+): PoolKeyModelFetchDisplay {
+  if (isCodexOAuthKey(key, providerType)) {
+    const errorText = String(key.last_models_fetch_error || '').trim()
+    const catalogReady = key.codex_model_catalog_ready === true
+    const lastAttemptText = key.last_models_fetch_at
+      ? formatUnixSecondsWithSeconds(key.last_models_fetch_at)
+      : ''
+
+    if (errorText) {
+      const hint = catalogReady
+        ? translate('pool.discovery.failedWithCatalogHint')
+        : translate('pool.discovery.failedActionHint')
+      const titleParts = [hint]
+      if (lastAttemptText) {
+        titleParts.push(translate('pool.discovery.lastAttemptAt', { time: lastAttemptText }))
+      }
+      return {
+        modelFetchLabel: translate('pool.discovery.failed'),
+        modelFetchClass: 'text-amber-600 dark:text-amber-400',
+        modelFetchTitle: titleParts.join('\n'),
+        modelFetchHint: hint,
+      }
+    }
+
+    if (catalogReady) {
+      return {
+        modelFetchLabel: translate('pool.discovery.ready'),
+        modelFetchClass: 'text-emerald-600 dark:text-emerald-400',
+        modelFetchTitle: lastAttemptText
+          ? translate('pool.discovery.lastDiscoveredAt', { time: lastAttemptText })
+          : translate('pool.discovery.readyTitle'),
+        modelFetchHint: '',
+      }
+    }
+
+    const hint = key.auto_fetch_models === false
+      ? translate('pool.discovery.pendingManualHint')
+      : translate('pool.discovery.pendingAutoHint')
+    const titleParts = [hint]
+    if (lastAttemptText) {
+      titleParts.push(translate('pool.discovery.lastAttemptAt', { time: lastAttemptText }))
+    }
+    return {
+      modelFetchLabel: translate('pool.discovery.pending'),
+      modelFetchClass: 'text-muted-foreground',
+      modelFetchTitle: titleParts.join('\n'),
+      modelFetchHint: hint,
+    }
+  }
+
+  if (!key.auto_fetch_models) {
+    return { modelFetchLabel: '', modelFetchClass: '', modelFetchTitle: '', modelFetchHint: '' }
+  }
+  if (key.last_models_fetch_error) {
+    return {
+      modelFetchLabel: translate('pool.discovery.syncFailed'),
+      modelFetchClass: 'text-amber-600 dark:text-amber-400',
+      modelFetchTitle: key.last_models_fetch_error,
+      modelFetchHint: '',
+    }
+  }
+  if (key.last_models_fetch_at) {
+    return {
+      modelFetchLabel: translate('pool.discovery.syncSuccess'),
+      modelFetchClass: 'text-emerald-600 dark:text-emerald-400',
+      modelFetchTitle: translate('pool.discovery.lastSyncedAt', {
+        time: formatUnixSecondsWithSeconds(key.last_models_fetch_at),
+      }),
+      modelFetchHint: '',
+    }
+  }
+  return {
+    modelFetchLabel: translate('pool.discovery.syncPending'),
+    modelFetchClass: 'text-muted-foreground',
+    modelFetchTitle: translate('pool.discovery.syncPendingTitle'),
+    modelFetchHint: '',
+  }
+}
+
+export interface AntigravityInferenceRejectionDisplay {
+  mode: 'cooldown' | 'history'
+  label: string
+  lastOccurredText: string
+  retryAtText: string
+  remainingText: string
+  title: string
+}
+
+export function getAntigravityInferenceRejectionDisplay(
+  key: PoolKeyDetail,
+  providerType: string | null | undefined,
+  tick: number,
+): AntigravityInferenceRejectionDisplay | null {
+  if (!isAntigravityProvider(providerType)) return null
+
+  const rejection = key.last_inference_rejection
+  const observedAt = Number(rejection?.observed_at ?? 0)
+  const retryAt = Number(rejection?.retry_at ?? 0)
+  const hasValidRejection = Number.isFinite(observedAt) && observedAt > 0
+  const lastOccurredText = hasValidRejection
+    ? translate('pool.status.inferenceRejectedLastOccurred', {
+        time: formatUnixSecondsWithSeconds(observedAt),
+      })
+    : ''
+  const retryAtText = Number.isFinite(retryAt) && retryAt > 0
+    ? translate('pool.status.inferenceRejectedRetryAt', {
+        time: formatUnixSecondsWithSeconds(retryAt),
+      })
+    : ''
+
+  if (isAntigravityInferenceRejectionCooldown(key, providerType, tick)) {
+    const remainingSeconds = key.cooldown_ttl_seconds != null && key.cooldown_ttl_seconds > 0
+      ? key.cooldown_ttl_seconds
+      : (Number.isFinite(retryAt) && retryAt > 0 && tick > 0
+          ? Math.max(0, Math.ceil(retryAt - tick / 1000))
+          : 0)
+    const remainingText = remainingSeconds > 0 ? formatTTL(remainingSeconds) : ''
+    const title = [
+      remainingText
+        ? `${translate('pool.status.inferenceRejected')} (${remainingText})`
+        : translate('pool.status.inferenceRejected'),
+      lastOccurredText,
+      retryAtText,
+    ].filter(Boolean).join('\n')
+    return {
+      mode: 'cooldown',
+      label: '',
+      lastOccurredText,
+      retryAtText,
+      remainingText,
+      title,
+    }
+  }
+
+  if (!hasValidRejection) return null
+
+  const label = translate('pool.status.inferenceRejectedHistory')
+  const title = [
+    translate('pool.status.inferenceRejectedHistoryTitle'),
+    lastOccurredText,
+    retryAtText,
+  ].filter(Boolean).join('\n')
+  return {
+    mode: 'history',
+    label,
+    lastOccurredText,
+    retryAtText,
+    remainingText: '',
+    title,
+  }
+}
+
+export function getSchedulingBadgeLabel(
+  key: PoolKeyDetail,
+  tick: number,
+  providerType?: string | null,
+): string {
   const accountAlert = getAccountAlertLabel(key)
   if (accountAlert) return compactPoolStatusLabel(accountAlert) || accountAlert
   const oauthAlert = getBlockingOAuthStatusLabel(key, tick)
   if (oauthAlert) return oauthAlert
+  if (isAntigravityInferenceRejectionCooldown(key, providerType, tick)) {
+    return translate('pool.status.inferenceRejected')
+  }
 
-  const knownLabel = getKnownSchedulingLabel(getVisibleSchedulingReason(key))
+  const effectiveProviderType = resolvePoolKeyProviderType(key, providerType)
+  const visibleReason = getVisibleSchedulingReason(key)
+  if (isQuotaExhaustedSchedulingCode(visibleReason)) {
+    return getQuotaExhaustedSchedulingLabel(effectiveProviderType, key.is_active)
+  }
+  const knownLabel = getKnownSchedulingLabel(visibleReason)
   if (knownLabel) {
     if (key.scheduling_reason === 'available' && isPoolKeyCostExhausted(key)) return translate('ui.limitExceeded')
     return knownLabel
+  }
+  if (key.is_active !== false && isQuotaSchedulingBlocked(key)) {
+    return getQuotaExhaustedSchedulingLabel(effectiveProviderType, key.is_active)
   }
 
   const rawLabel = String(key.scheduling_label || '')
@@ -231,13 +447,18 @@ export function getSchedulingBadgeLabel(key: PoolKeyDetail, tick: number): strin
   return translate('ui.available4d99c97')
 }
 
-export function getSchedulingBadgeVariant(key: PoolKeyDetail, tick: number): PoolStatusVariant {
+export function getSchedulingBadgeVariant(
+  key: PoolKeyDetail,
+  tick: number,
+  providerType?: string | null,
+): PoolStatusVariant {
   if (getAccountAlertLabel(key)) return 'destructive'
   if (getBlockingOAuthStatusLabel(key, tick)) return 'destructive'
+  if (isAntigravityInferenceRejectionCooldown(key, providerType, tick)) return 'warning'
 
   const reason = getVisibleSchedulingReason(key)
   if (reason === 'manual_disabled' || reason === 'inactive') return 'secondary'
-  if (reason === 'account_blocked' || reason === 'account_quota_exhausted' || reason === 'key_quota_exhausted' || reason === 'cost_exhausted') return 'destructive'
+  if (reason === 'account_blocked' || reason === 'account_quota_exhausted' || reason === 'key_quota_exhausted' || reason === 'quota_exhausted' || reason === 'cost_exhausted') return 'destructive'
   if (reason === 'cooldown') return 'warning'
   if (reason === 'cost_soft' || reason === 'cost') return 'warning'
   if (isPoolKeyCostExhausted(key)) return 'destructive'
@@ -250,22 +471,50 @@ export function getSchedulingBadgeVariant(key: PoolKeyDetail, tick: number): Poo
   return 'default'
 }
 
-export function getSchedulingTitle(key: PoolKeyDetail, tick: number): string {
-  const accountAlertTitle = getAccountAlertTitle(key)
+export function getSchedulingTitle(
+  key: PoolKeyDetail,
+  tick: number,
+  providerType?: string | null,
+): string {
+  const effectiveProviderType = resolvePoolKeyProviderType(key, providerType)
+  const accountAlertTitle = getAccountAlertTitle(key, effectiveProviderType)
   if (accountAlertTitle) return accountAlertTitle
   if (getBlockingOAuthStatusLabel(key, tick)) return getOAuthStatusTitle(key, tick)
 
+  if (isAntigravityInferenceRejectionCooldown(key, effectiveProviderType, tick)) {
+    const rejectionDisplay = getAntigravityInferenceRejectionDisplay(key, effectiveProviderType, tick)
+    if (rejectionDisplay?.title) return rejectionDisplay.title
+  }
+
   const reasons = getVisibleSchedulingReasons(key)
   if (reasons.length > 0) {
+    let hasRecoverableQuotaHold = false
     const title = reasons.map((item) => {
       const ttl = item.ttl_seconds && item.ttl_seconds > 0 ? ` (${formatTTL(item.ttl_seconds)})` : ''
       const detail = item.detail ? ` - ${item.detail}` : ''
+      if (isQuotaExhaustedSchedulingCode(item.code)) {
+        if (item.blocking !== false && isRecoverableRuntimeQuotaHold(effectiveProviderType, key.is_active)) {
+          hasRecoverableQuotaHold = true
+        }
+        return `${getQuotaExhaustedSchedulingLabel(effectiveProviderType, key.is_active)}${ttl}${detail}`
+      }
       return `${getKnownSchedulingLabel(item.code) ?? item.label}${ttl}${detail}`
     }).join('\n')
+    const lines = [title]
+    const hint = hasRecoverableQuotaHold
+      ? getQuotaExhaustedSchedulingHint(effectiveProviderType, key.is_active)
+      : null
+    if (hint) lines.push(hint)
     const observedAt = key.status_snapshot?.scheduling?.last_observed_at
-    return typeof observedAt === 'number'
-      ? `${title}\n${translate('pool.status.observedAt', { time: new Date(observedAt * 1000).toLocaleString(getI18nLocale()) })}`
-      : title
+    if (typeof observedAt === 'number') {
+      lines.push(translate('pool.status.observedAt', { time: new Date(observedAt * 1000).toLocaleString(getI18nLocale()) }))
+    }
+    const baseTitle = lines.join('\n')
+    if (isAntigravityProvider(effectiveProviderType)) {
+      const rejectionDisplay = getAntigravityInferenceRejectionDisplay(key, effectiveProviderType, tick)
+      if (rejectionDisplay?.title) return `${baseTitle}\n${rejectionDisplay.title}`
+    }
+    return baseTitle
   }
 
   if (key.cooldown_reason) {
@@ -273,7 +522,25 @@ export function getSchedulingTitle(key: PoolKeyDetail, tick: number): string {
     return `${formatCooldownReason(key.cooldown_reason)}${ttl}`
   }
   if (isPoolKeyCostExhausted(key)) return translate('ui.limitExceeded')
-  return getSchedulingBadgeLabel(key, tick)
+  const baseLabel = getSchedulingBadgeLabel(key, tick, effectiveProviderType)
+  const lines = [baseLabel]
+  const isRecoverableQuotaHold = isRecoverableRuntimeQuotaHold(effectiveProviderType, key.is_active)
+    && (isQuotaExhaustedSchedulingCode(getVisibleSchedulingReason(key)) || isQuotaSchedulingBlocked(key))
+  if (isRecoverableQuotaHold) {
+    const hint = getQuotaExhaustedSchedulingHint(effectiveProviderType, key.is_active)
+    if (hint) lines.push(hint)
+    const schedulingReason = String(key.status_snapshot?.scheduling?.reason || '').trim()
+    if (schedulingReason) lines.push(schedulingReason)
+    const observedAt = key.status_snapshot?.scheduling?.last_observed_at
+    if (typeof observedAt === 'number') {
+      lines.push(translate('pool.status.observedAt', { time: new Date(observedAt * 1000).toLocaleString(getI18nLocale()) }))
+    }
+  }
+  if (isAntigravityProvider(effectiveProviderType)) {
+    const rejectionDisplay = getAntigravityInferenceRejectionDisplay(key, effectiveProviderType, tick)
+    if (rejectionDisplay?.title) lines.push(rejectionDisplay.title)
+  }
+  return lines.join('\n')
 }
 
 export function formatTTL(seconds: number): string {
@@ -390,7 +657,7 @@ export function getAccountAlertLabel(key: PoolKeyDetail): string | null {
   return result
 }
 
-export function getAccountAlertTitle(key: PoolKeyDetail): string {
+export function getAccountAlertTitle(key: PoolKeyDetail, providerType?: string | null): string {
   const label = getAccountAlertLabel(key)
   if (!label) return ''
 
@@ -400,7 +667,15 @@ export function getAccountAlertTitle(key: PoolKeyDetail): string {
   }
 
   const quotaAlert = getQuotaAlertSnapshotState(key)
-  if (quotaAlert?.title) return quotaAlert.title
+  if (quotaAlert?.title) {
+    const quotaCode = String(getQuotaSnapshot(key)?.code || '').trim().toLowerCase()
+    const effectiveProviderType = resolvePoolKeyProviderType(key, providerType)
+    if (quotaCode === 'exhausted' && isRecoverableRuntimeQuotaHold(effectiveProviderType, key.is_active)) {
+      const hint = getQuotaExhaustedSchedulingHint(effectiveProviderType, key.is_active)
+      return hint ? `${quotaAlert.title}\n${hint}` : quotaAlert.title
+    }
+    return quotaAlert.title
+  }
 
   const quotaText = getLegacyAccountQuotaText(key)
   if (quotaText) return `${label}: ${quotaText}`
@@ -443,6 +718,18 @@ export function formatUnixSeconds(seconds: number | null | undefined): string {
   const raw = Number(seconds ?? 0)
   if (!Number.isFinite(raw) || raw <= 0) return '-'
   return formatRelativeTime(new Date(raw * 1000).toISOString())
+}
+export function formatUnixSecondsWithSeconds(seconds: number | null | undefined): string {
+  const raw = Number(seconds ?? 0)
+  if (!Number.isFinite(raw) || raw <= 0) return '-'
+  const date = new Date(raw * 1000)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const M = pad(date.getMonth() + 1)
+  const D = pad(date.getDate())
+  const h = pad(date.getHours())
+  const m = pad(date.getMinutes())
+  const s = pad(date.getSeconds())
+  return `${M}-${D} ${h}:${m}:${s}`
 }
 
 export function formatRelativeTime(isoStr: string): string {

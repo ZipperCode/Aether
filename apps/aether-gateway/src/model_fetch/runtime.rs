@@ -8,10 +8,11 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogModelFetchCandidate, StoredProviderCatalogProvider,
 };
 use aether_model_fetch::{
-    aggregate_models_for_cache, apply_model_filters, fetch_models_from_transports_for_management,
-    global_model_matches_allowed_models, json_string_list, load_codex_image_models,
-    model_catalog_upstream_metadata, model_fetch_interval_minutes,
-    model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
+    aggregate_models_for_cache, apply_model_filters, ensure_discovered_global_models,
+    fetch_models_from_transports_for_management, global_model_matches_allowed_models,
+    json_string_list, load_codex_image_models, model_catalog_upstream_metadata,
+    model_fetch_interval_minutes, model_fetch_startup_delay_seconds, model_fetch_startup_enabled,
+    pool_auto_publish_discovered_models_enabled, preset_models_for_provider,
     reconcile_provider_model_whitelist_availability,
     selected_models_fetch_endpoints_for_api_formats, supplement_codex_management_models,
     sync_provider_model_discovery_associations, sync_provider_model_whitelist_associations,
@@ -31,6 +32,7 @@ use self::state::ModelFetchRuntimeState;
 #[derive(Debug, Clone)]
 struct SelectedFetchTarget {
     provider: StoredProviderCatalogProvider,
+    auto_publish_discovered_models: bool,
     key: StoredProviderCatalogModelFetchCandidate,
     endpoints: Vec<StoredProviderCatalogEndpoint>,
     capability_endpoints: Arc<Vec<StoredProviderCatalogEndpoint>>,
@@ -276,6 +278,8 @@ where
             .map(sanitize_model_fetch_endpoint)
             .collect::<Vec<_>>();
         let keys = keys_by_provider.remove(&provider.id).unwrap_or_default();
+        let auto_publish_discovered_models = provider.is_active
+            && pool_auto_publish_discovered_models_enabled(provider.config.as_ref());
         let provider = sanitize_model_fetch_provider(provider);
         // 图片配置与准确绑定按 Provider 读取一次，所有 Key 共用，不读取完整 Key 列表。
         let image_models = Arc::new(
@@ -297,6 +301,7 @@ where
             );
             targets.push(SelectedFetchTarget {
                 provider: provider.clone(),
+                auto_publish_discovered_models,
                 key,
                 endpoints: selected_endpoints,
                 capability_endpoints: Arc::clone(&capability_endpoints),
@@ -612,11 +617,13 @@ async fn fetch_and_persist_key_models(
                 .filter_map(Value::as_str)
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>();
+            let include_patterns = json_string_list(target.key.model_include_patterns.as_ref());
+            let exclude_patterns = json_string_list(target.key.model_exclude_patterns.as_ref());
             let filtered_models = apply_model_filters(
                 &fetched_model_ids,
                 json_string_list(target.key.locked_models.as_ref()),
-                json_string_list(target.key.model_include_patterns.as_ref()),
-                json_string_list(target.key.model_exclude_patterns.as_ref()),
+                include_patterns.clone(),
+                exclude_patterns.clone(),
             );
             persist_key_fetch_success(
                 state,
@@ -820,6 +827,8 @@ async fn fetch_and_persist_key_models(
 
     // 版本化 Codex 卡片保留在专用动态目录中；旧缓存与自动绑定消费带 Endpoint
     // 投影的兼容模型，避免把内部绑定字段写回不透明上游卡片。
+    let true_fetched_model_ids = result.fetched_model_ids.clone();
+    let true_discovered_models = result.legacy_models.clone();
     let mut association_models = result.legacy_models;
     let used_preset_catalog = result.used_preset_catalog;
     let successful_endpoint_ids = result.successful_endpoint_ids;
@@ -859,11 +868,13 @@ async fn fetch_and_persist_key_models(
     } else {
         result.fetched_model_ids
     };
+    let include_patterns = json_string_list(target.key.model_include_patterns.as_ref());
+    let exclude_patterns = json_string_list(target.key.model_exclude_patterns.as_ref());
     let filtered_models = apply_model_filters(
         &fetched_model_ids,
         json_string_list(target.key.locked_models.as_ref()),
-        json_string_list(target.key.model_include_patterns.as_ref()),
-        json_string_list(target.key.model_exclude_patterns.as_ref()),
+        include_patterns.clone(),
+        exclude_patterns.clone(),
     );
     persist_key_fetch_success(
         state,
@@ -891,6 +902,25 @@ async fn fetch_and_persist_key_models(
     state
         .write_upstream_models_cache(&target.provider.id, &target.key.id, &association_models)
         .await;
+    if target.auto_publish_discovered_models && target.provider.is_active && !used_preset_catalog {
+        let discovered_filtered_models = apply_model_filters(
+            &true_fetched_model_ids,
+            Vec::new(),
+            include_patterns,
+            exclude_patterns,
+        );
+        let default_tiered_pricing =
+            aether_admin::provider::models_write::default_admin_import_tiered_pricing();
+        ensure_discovered_global_models(
+            state,
+            &target.provider.id,
+            &discovered_filtered_models,
+            &true_discovered_models,
+            Some(&default_tiered_pricing),
+        )
+        .await
+        .map_err(GatewayError::Internal)?;
+    }
     sync_provider_model_discovery_associations(
         state,
         &target.provider.id,
@@ -1173,8 +1203,9 @@ mod tests {
     };
     use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot};
     use aether_data_contracts::repository::global_models::{
-        AdminGlobalModelListQuery, AdminProviderModelListQuery, StoredAdminGlobalModelPage,
-        StoredAdminProviderModel, StoredModelEndpointBinding, UpsertAdminProviderModelRecord,
+        AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
+        StoredAdminGlobalModel, StoredAdminGlobalModelPage, StoredAdminProviderModel,
+        StoredModelEndpointBinding, UpsertAdminProviderModelRecord,
     };
     use aether_data_contracts::repository::provider_catalog::{
         ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
@@ -1353,6 +1384,20 @@ mod tests {
                 items: Vec::new(),
                 total: 0,
             })
+        }
+
+        async fn get_admin_global_model_by_name(
+            &self,
+            _name: &str,
+        ) -> Result<Option<StoredAdminGlobalModel>, Self::Error> {
+            Ok(None)
+        }
+
+        async fn create_admin_global_model(
+            &self,
+            _record: &CreateAdminGlobalModelRecord,
+        ) -> Result<Option<StoredAdminGlobalModel>, Self::Error> {
+            Ok(None)
         }
 
         async fn list_model_endpoint_bindings(

@@ -548,6 +548,16 @@ pub(crate) async fn refresh_antigravity_provider_quota_locally(
         }
 
         if status == "success" {
+            if let Some(incoming) = metadata_update.as_ref().and_then(|m| m.get("antigravity")) {
+                crate::handlers::admin::provider::shared::quota_recovery::recover_oauth_quota_hold(
+                    state,
+                    &key,
+                    "antigravity",
+                    now_unix_secs,
+                    incoming,
+                )
+                .await?;
+            }
             // Only positive exact models from this persisted refresh clear facts,
             // and only when the captured observation is still byte-identical.
             if let Some(captured) = captured_quota.as_ref() {

@@ -3,7 +3,7 @@ use super::duplicates::{
     release_provider_oauth_account_locks,
 };
 use super::errors::build_internal_control_error_response;
-use super::runtime::spawn_provider_oauth_account_state_refresh_after_update;
+use super::runtime::spawn_provider_oauth_account_state_refresh_after_persistence;
 use super::state::{
     decode_jwt_claims, enrich_admin_provider_oauth_auth_config, json_non_empty_string,
     json_u64_value,
@@ -239,7 +239,7 @@ pub(crate) async fn provision_provider_oauth_token_payload_for_provider(
                 &api_formats,
                 key_proxy,
                 expires_at,
-                false,
+                provider_type == "codex",
             )
             .await
         {
@@ -259,11 +259,12 @@ pub(crate) async fn provision_provider_oauth_token_payload_for_provider(
     };
     release_provider_oauth_account_locks(state, oauth_account_leases).await;
 
-    spawn_provider_oauth_account_state_refresh_after_update(
+    spawn_provider_oauth_account_state_refresh_after_persistence(
         state.cloned_app(),
         provider.clone(),
         persisted_key.id.clone(),
         request_proxy,
+        replaced,
     );
 
     Ok(Json(json!({

@@ -249,6 +249,34 @@ pub(crate) fn spawn_provider_oauth_account_state_refresh_after_update(
     });
 }
 
+/// 额度刷新独立于首次模型发现；重授权不改变旧账号的拉取偏好和已知目录。
+pub(crate) fn spawn_provider_oauth_account_state_refresh_after_persistence(
+    app: AppState,
+    provider: StoredProviderCatalogProvider,
+    key_id: String,
+    proxy_override: Option<ProxySnapshot>,
+    replaced: bool,
+) {
+    if !replaced && provider.provider_type.trim().eq_ignore_ascii_case("codex") {
+        let app = app.clone();
+        let provider_id = provider.id.clone();
+        let key_id = key_id.clone();
+        spawn_fire_and_forget(TASK_KEY_PROVIDER_OAUTH_ACCOUNT_REFRESH, async move {
+            if let Err(error) =
+                crate::model_fetch::perform_model_fetch_for_key(&app, &provider_id, &key_id).await
+            {
+                tracing::warn!(
+                    provider_id = %provider_id,
+                    key_id = %key_id,
+                    error = %crate::model_fetch::safe_model_fetch_error(&error.into_message()),
+                    "gateway post-create codex model fetch failed"
+                );
+            }
+        });
+    }
+    spawn_provider_oauth_account_state_refresh_after_update(app, provider, key_id, proxy_override);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

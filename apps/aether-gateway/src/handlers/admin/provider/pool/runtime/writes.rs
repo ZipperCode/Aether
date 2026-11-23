@@ -433,6 +433,21 @@ pub(crate) async fn record_admin_provider_pool_success(
     }
 }
 
+/// 普通权限拒绝仅暂退，不是封号。返回调度实际使用的重试时间（Unix 秒）。
+pub(crate) async fn record_pool_forbidden_cooldown(
+    runtime: &RuntimeState,
+    provider_id: &str,
+    key_id: &str,
+    pool_config: &AdminProviderPoolConfig,
+) -> u64 {
+    let ttl = pool_config
+        .rate_limit_cooldown_seconds
+        .clamp(300, MAX_POOL_COOLDOWN_SECONDS);
+    let retry_at = crate::clock::current_unix_secs().saturating_add(ttl);
+    set_pool_cooldown(runtime, provider_id, key_id, "forbidden_403", ttl).await;
+    retry_at
+}
+
 pub(crate) async fn record_admin_provider_pool_error(
     runtime: &RuntimeState,
     provider_id: &str,
@@ -463,14 +478,7 @@ pub(crate) async fn record_admin_provider_pool_error(
             spawn_remove_pool_active_probe_member(runtime, provider_id, key_id);
             return;
         }
-        set_pool_cooldown(
-            runtime,
-            provider_id,
-            key_id,
-            "forbidden_403",
-            pool_config.rate_limit_cooldown_seconds.max(300),
-        )
-        .await;
+        record_pool_forbidden_cooldown(runtime, provider_id, key_id, pool_config).await;
         return;
     }
 

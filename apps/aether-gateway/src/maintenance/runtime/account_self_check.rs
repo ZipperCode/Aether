@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aether_data_contracts::repository::pool_scores::{
@@ -24,6 +24,7 @@ use crate::handlers::shared::provider_pool::{
 };
 use crate::{AppState, GatewayError};
 
+use crate::ai_serving::provider_key_pool_score_scope;
 use super::{shared_auth_maintenance_gate, AuthMaintenanceGate};
 
 const ACCOUNT_SELF_CHECK_REDIS_PREFIX: &str = "ap:account_self_check:last";
@@ -32,6 +33,7 @@ const ACCOUNT_SELF_CHECK_DEFAULT_SCAN_INTERVAL_SECONDS: u64 = 60;
 const ACCOUNT_SELF_CHECK_MIN_SCAN_INTERVAL_SECONDS: u64 = 15;
 const ACCOUNT_SELF_CHECK_DEFAULT_MAX_KEYS_PER_PROVIDER: usize = 200;
 const ACCOUNT_SELF_CHECK_DEFAULT_GLOBAL_CONCURRENCY: usize = 16;
+const ACCOUNT_SELF_CHECK_POOL_SCORE_READ_LIMIT: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct AccountSelfCheckRunSummary {
@@ -302,11 +304,99 @@ pub(crate) fn select_account_self_check_key_ids(
         .collect()
 }
 
+fn is_runtime_quota_exhausted_revisit_key(key: &StoredProviderCatalogKey) -> bool {
+    if !key.is_active
+        || key.oauth_invalid_at_unix_secs.is_some()
+        || key
+            .oauth_invalid_reason
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|reason| !reason.is_empty())
+        || !provider_pool_key_runtime_quota_blocked(key)
+    {
+        return false;
+    }
+    let Some(scheduling) = key
+        .status_snapshot
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|snapshot| snapshot.get("scheduling"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let has_runtime_source = scheduling
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|source| !source.is_empty() && !source.eq_ignore_ascii_case("manual"));
+    let has_credential_fingerprint = scheduling
+        .get("credential_fingerprint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|fingerprint| !fingerprint.is_empty());
+    has_runtime_source && has_credential_fingerprint
+}
+
+async fn load_runtime_quota_exhausted_candidate_ids_from_scores(
+    state: &AppState,
+    provider_id: &str,
+) -> Option<BTreeSet<String>> {
+    if !state.data.has_pool_score_reader() {
+        return None;
+    }
+    let scope = provider_key_pool_score_scope();
+    let exhausted_scores = state
+        .data
+        .list_pool_member_scores(&ListPoolMemberScoresQuery {
+            pool_kind: POOL_KIND_PROVIDER_KEY_POOL.to_string(),
+            pool_id: provider_id.to_string(),
+            capability: Some(scope.capability.clone()),
+            scope_kind: Some(scope.scope_kind.clone()),
+            scope_id: scope.scope_id.clone(),
+            hard_states: vec![PoolMemberHardState::QuotaExhausted],
+            probe_statuses: None,
+            offset: 0,
+            limit: ACCOUNT_SELF_CHECK_POOL_SCORE_READ_LIMIT,
+        })
+        .await
+        .ok()?;
+    if !exhausted_scores.is_empty() {
+        return Some(
+            exhausted_scores
+                .into_iter()
+                .map(|score| score.member_id)
+                .collect(),
+        );
+    }
+    let any_scores = state
+        .data
+        .list_pool_member_scores(&ListPoolMemberScoresQuery {
+            pool_kind: POOL_KIND_PROVIDER_KEY_POOL.to_string(),
+            pool_id: provider_id.to_string(),
+            capability: Some(scope.capability),
+            scope_kind: Some(scope.scope_kind),
+            scope_id: scope.scope_id,
+            hard_states: Vec::new(),
+            probe_statuses: None,
+            offset: 0,
+            limit: 1,
+        })
+        .await
+        .ok()?;
+    if any_scores.is_empty() {
+        None
+    } else {
+        Some(BTreeSet::new())
+    }
+}
+
 /// 在 Provider 分布式锁内选出到期的轻量 Key ID，不提前读取或保留完整凭据。
 async fn select_key_ids_for_provider(
     state: &AppState,
     runtime: &RuntimeState,
     provider: &StoredProviderCatalogProvider,
+    routine_enabled: bool,
     interval_seconds: u64,
     max_keys_per_provider: usize,
     now_ts: u64,
@@ -317,7 +407,7 @@ async fn select_key_ids_for_provider(
     }
 
     let result = async {
-        let candidates = state
+        let mut candidates = state
             .list_provider_catalog_auth_maintenance_candidates_by_provider_ids(
                 std::slice::from_ref(&provider.id),
             )
@@ -325,6 +415,24 @@ async fn select_key_ids_for_provider(
             .into_iter()
             .filter(|candidate| candidate.is_active && candidate.provider_id == provider.id)
             .collect::<Vec<_>>();
+        if !routine_enabled {
+            candidates.retain(|candidate| {
+                candidate.oauth_invalid_at_unix_secs.is_none()
+                    && candidate
+                        .oauth_invalid_reason
+                        .as_deref()
+                        .map(str::trim)
+                        .is_none_or(str::is_empty)
+            });
+            if candidates.is_empty() {
+                return Ok(Vec::new());
+            }
+            if let Some(exhausted_member_ids) =
+                load_runtime_quota_exhausted_candidate_ids_from_scores(state, &provider.id).await
+            {
+                candidates.retain(|candidate| exhausted_member_ids.contains(&candidate.id));
+            }
+        }
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -485,6 +593,8 @@ async fn perform_account_self_check_candidate_under_gate(
     key_id: String,
     attempted_at: u64,
     serving_policy: ProviderQuotaServingPolicy,
+    routine_enabled: bool,
+    revisit_runtime_quota_exhausted: bool,
     gate: AuthMaintenanceGate,
 ) -> Result<Option<AccountSelfCheckOutcome>, GatewayError> {
     let _permit = gate.acquire().await?;
@@ -497,12 +607,30 @@ async fn perform_account_self_check_candidate_under_gate(
         // 与旧版批量强读保持一致：已删除 Key 不进入 selected/scanned 汇总。
         return Ok(None);
     };
-    if !key.is_active || provider_pool_key_runtime_quota_blocked(&key) {
-        // 资格在轻量选中后发生变化时只跳过本 Key，不把它伪计为一次检查。
+    if !key.is_active {
+        return Ok(None);
+    }
+    let is_runtime_quota_revisit =
+        revisit_runtime_quota_exhausted && is_runtime_quota_exhausted_revisit_key(&key);
+    if provider_pool_key_runtime_quota_blocked(&key) {
+        if !is_runtime_quota_revisit {
+            // 资格在轻量选中后发生变化时只跳过本 Key，不把它伪计为一次检查。
+            return Ok(None);
+        }
+    } else if !routine_enabled {
         return Ok(None);
     }
 
-    if matches!(serving_policy, ProviderQuotaServingPolicy::ServingProbe) {
+    let effective_serving_policy = if !routine_enabled || is_runtime_quota_revisit {
+        ProviderQuotaServingPolicy::ObservationOnly
+    } else {
+        serving_policy
+    };
+
+    if matches!(
+        effective_serving_policy,
+        ProviderQuotaServingPolicy::ServingProbe
+    ) {
         record_score_probe_in_progress_for_key(state, &provider.id, &key.id, attempted_at).await;
     }
     let outcome = match perform_quota_refresh_check(
@@ -526,7 +654,7 @@ async fn perform_account_self_check_candidate_under_gate(
         &key_id,
         attempted_at,
         &outcome,
-        serving_policy,
+        effective_serving_policy,
     )
     .await;
     Ok(Some(outcome))
@@ -871,6 +999,39 @@ fn account_self_check_config_for_provider(
     pool_config.filter(|config| config.account_self_check_enabled)
 }
 
+#[derive(Debug, Clone)]
+struct AccountSelfCheckProviderPlan {
+    pool_config: AdminProviderPoolConfig,
+    routine_enabled: bool,
+    revisit_runtime_quota_exhausted: bool,
+}
+
+/// 解析账户自检执行计划；Codex/Antigravity Pool 在常规自检关闭时仍按既有周期只读复核运行时额度耗尽 Key。
+fn account_self_check_plan_for_provider(
+    provider: &StoredProviderCatalogProvider,
+    provider_type: &str,
+) -> Option<AccountSelfCheckProviderPlan> {
+    let is_codex_or_antigravity = matches!(provider_type, "codex" | "antigravity");
+    let has_pool_config = admin_provider_pool_config(provider);
+    if let Some(pool_config) = account_self_check_config_for_provider(provider, provider_type) {
+        return Some(AccountSelfCheckProviderPlan {
+            pool_config,
+            routine_enabled: true,
+            revisit_runtime_quota_exhausted: is_codex_or_antigravity && has_pool_config.is_some(),
+        });
+    }
+    if is_codex_or_antigravity {
+        if let Some(pool_config) = has_pool_config {
+            return Some(AccountSelfCheckProviderPlan {
+                pool_config,
+                routine_enabled: false,
+                revisit_runtime_quota_exhausted: true,
+            });
+        }
+    }
+    None
+}
+
 /// 执行一轮账户自检；低余额 Key 仍按原周期刷新，以便余额恢复后自动重新准入。
 pub(crate) async fn perform_account_self_check_once_with_config(
     state: &AppState,
@@ -900,9 +1061,8 @@ async fn perform_account_self_check_once_with_config_and_gate(
         .into_iter()
         .filter_map(|provider| {
             let provider_type = provider.provider_type.trim().to_ascii_lowercase();
-            let pool_config =
-                account_self_check_config_for_provider(&provider, provider_type.as_str())?;
-            Some((provider, provider_type, pool_config))
+            let plan = account_self_check_plan_for_provider(&provider, provider_type.as_str())?;
+            Some((provider, provider_type, plan))
         })
         .collect::<Vec<_>>();
 
@@ -932,7 +1092,7 @@ async fn perform_account_self_check_once_with_config_and_gate(
         ..AccountSelfCheckRunSummary::empty()
     };
 
-    for (provider, provider_type, pool_config) in providers {
+    for (provider, provider_type, plan) in providers {
         let provider_endpoints = endpoints_by_provider
             .get(&provider.id)
             .map(Vec::as_slice)
@@ -945,10 +1105,15 @@ async fn perform_account_self_check_once_with_config_and_gate(
             summary.providers_skipped = summary.providers_skipped.saturating_add(1);
             continue;
         }
-        let serving_policy = provider_quota_serving_policy(&provider_type)
-            .unwrap_or(ProviderQuotaServingPolicy::ServingProbe);
+        let serving_policy = if plan.routine_enabled {
+            provider_quota_serving_policy(&provider_type)
+                .unwrap_or(ProviderQuotaServingPolicy::ServingProbe)
+        } else {
+            ProviderQuotaServingPolicy::ObservationOnly
+        };
 
-        let interval_seconds = pool_config
+        let interval_seconds = plan
+            .pool_config
             .account_self_check_interval_minutes
             .clamp(1, 1440)
             .saturating_mul(60);
@@ -957,6 +1122,7 @@ async fn perform_account_self_check_once_with_config_and_gate(
             state,
             state.runtime_state.as_ref(),
             &provider,
+            plan.routine_enabled,
             interval_seconds,
             provider_limit,
             now_ts,
@@ -967,7 +1133,7 @@ async fn perform_account_self_check_once_with_config_and_gate(
         }
 
         let provider_short_id = provider.id.chars().take(8).collect::<String>();
-        let concurrency = (pool_config.account_self_check_concurrency as usize)
+        let concurrency = (plan.pool_config.account_self_check_concurrency as usize)
             .clamp(1, 64)
             .min(config.global_concurrency)
             .min(gate.concurrency())
@@ -988,6 +1154,8 @@ async fn perform_account_self_check_once_with_config_and_gate(
                     key_id,
                     now_ts,
                     serving_policy,
+                    plan.routine_enabled,
+                    plan.revisit_runtime_quota_exhausted,
                     gate,
                 )
                 .await
@@ -1077,28 +1245,34 @@ pub(crate) fn spawn_account_self_check_worker(
 #[cfg(test)]
 mod tests {
     use super::{
-        account_self_check_config_for_provider, gateway_error_category,
-        quota_payload_result_for_key, record_score_probe_result_for_key,
-        score_reason_patch_for_outcome, select_account_self_check_key_ids,
-        update_summary_from_outcome, update_summary_from_revalidated_candidate,
-        AccountSelfCheckOutcome, AccountSelfCheckRunSummary,
+        account_self_check_config_for_provider, account_self_check_plan_for_provider,
+        gateway_error_category, is_runtime_quota_exhausted_revisit_key,
+        perform_account_self_check_once, quota_payload_result_for_key,
+        record_score_probe_result_for_key, score_reason_patch_for_outcome,
+        select_account_self_check_key_ids, update_summary_from_outcome,
+        update_summary_from_revalidated_candidate, AccountSelfCheckOutcome,
+        AccountSelfCheckRunSummary,
     };
     use crate::GatewayError;
-    use serde_json::json;
-    use std::collections::BTreeMap;
-
-    use std::sync::Arc;
-
+    use aether_contracts::ExecutionPlan;
+    use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
     use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
+    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
     use aether_data_contracts::repository::pool_scores::{
         GetPoolMemberScoresByIdsQuery, PoolMemberHardState, PoolMemberProbeStatus,
         StoredPoolMemberScore,
     };
-    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
+    use aether_data_contracts::repository::provider_catalog::{
+        StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
     use aether_provider_pool::ProviderQuotaServingPolicy;
+    use axum::routing::any;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
     use crate::{data::GatewayDataState, AppState};
-
     /// 构造账户自检策略测试所需的最小 Provider。
     fn provider(
         provider_type: &str,
@@ -1338,5 +1512,599 @@ mod tests {
 
         assert_eq!(gateway_error_category(&error), "internal_error");
         assert!(!gateway_error_category(&error).contains("database-secret"));
+    }
+
+    fn sample_pool_key(
+        provider_id: &str,
+        key_id: &str,
+        is_active: bool,
+        auth_config_json: &str,
+        status_snapshot: Option<serde_json::Value>,
+    ) -> StoredProviderCatalogKey {
+        let mut key = StoredProviderCatalogKey::new(
+            key_id.to_string(),
+            provider_id.to_string(),
+            key_id.to_string(),
+            "oauth".to_string(),
+            None,
+            is_active,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            None,
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, &format!("ya29.{key_id}"))
+                .expect("api key ciphertext should build"),
+            Some(
+                encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, auth_config_json)
+                    .expect("auth config ciphertext should build"),
+            ),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build");
+        key.status_snapshot = status_snapshot;
+        key
+    }
+
+    fn sample_pool_score(
+        provider_id: &str,
+        key_id: &str,
+        hard_state: PoolMemberHardState,
+        score_reason: serde_json::Value,
+    ) -> StoredPoolMemberScore {
+        StoredPoolMemberScore {
+            id: format!("score-{key_id}"),
+            pool_kind: "provider_key_pool".to_string(),
+            pool_id: provider_id.to_string(),
+            member_kind: "provider_api_key".to_string(),
+            member_id: key_id.to_string(),
+            capability: "account".to_string(),
+            scope_kind: "account".to_string(),
+            scope_id: None,
+            score: 0.5,
+            hard_state,
+            score_version: 1,
+            score_reason,
+            last_ranked_at: None,
+            last_scheduled_at: None,
+            last_success_at: None,
+            last_failure_at: None,
+            failure_count: 0,
+            last_probe_attempt_at: None,
+            last_probe_success_at: None,
+            last_probe_failure_at: None,
+            probe_failure_count: 0,
+            probe_status: PoolMemberProbeStatus::Never,
+            updated_at: 100,
+        }
+    }
+
+    #[test]
+    fn codex_and_antigravity_pool_plan_enables_runtime_quota_revisit_when_routine_off() {
+        let codex_pool = account_self_check_plan_for_provider(
+            &provider("codex", Some(json!({"pool_advanced": {}}))),
+            "codex",
+        )
+        .expect("codex pool should enable runtime quota revisit even when routine self-check is off");
+        assert!(!codex_pool.routine_enabled);
+        assert!(codex_pool.revisit_runtime_quota_exhausted);
+        assert_eq!(codex_pool.pool_config.account_self_check_interval_minutes, 60);
+
+        let antigravity_pool = account_self_check_plan_for_provider(
+            &provider(
+                "antigravity",
+                Some(json!({
+                    "pool_advanced": {
+                        "probing_enabled": false,
+                        "account_self_check_enabled": false,
+                        "account_self_check_interval_minutes": 30,
+                        "account_self_check_concurrency": 2
+                    }
+                })),
+            ),
+            "antigravity",
+        )
+        .expect("antigravity pool should keep configured cadence when routine self-check is off");
+        assert!(!antigravity_pool.routine_enabled);
+        assert!(antigravity_pool.revisit_runtime_quota_exhausted);
+        assert_eq!(
+            antigravity_pool
+                .pool_config
+                .account_self_check_interval_minutes,
+            30
+        );
+        assert_eq!(antigravity_pool.pool_config.account_self_check_concurrency, 2);
+
+        assert!(account_self_check_plan_for_provider(&provider("codex", None), "codex").is_none());
+        assert!(account_self_check_plan_for_provider(
+            &provider("claude_code", Some(json!({"pool_advanced": {}}))),
+            "claude_code"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn runtime_quota_exhausted_revisit_filter_excludes_manual_ban_disabled_and_oauth_invalid() {
+        let runtime_http_402 = sample_pool_key(
+            "provider-codex",
+            "key-runtime-402",
+            true,
+            "{}",
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "requires_manual_recovery": true,
+                    "source": "http_payment_required",
+                    "credential_fingerprint": "fp-1",
+                    "last_observed_at": 100
+                }
+            })),
+        );
+        assert!(is_runtime_quota_exhausted_revisit_key(&runtime_http_402));
+
+        let runtime_error_code = sample_pool_key(
+            "provider-antigravity",
+            "key-runtime-err",
+            true,
+            "{}",
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "source": "error_code",
+                    "credential_fingerprint": "fp-2"
+                }
+            })),
+        );
+        assert!(is_runtime_quota_exhausted_revisit_key(&runtime_error_code));
+
+        let manual_no_fingerprint = sample_pool_key(
+            "provider-codex",
+            "key-manual-1",
+            true,
+            "{}",
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "requires_manual_recovery": true,
+                    "source": "runtime_quota_exhaustion"
+                }
+            })),
+        );
+        assert!(!is_runtime_quota_exhausted_revisit_key(&manual_no_fingerprint));
+
+        let manual_source = sample_pool_key(
+            "provider-codex",
+            "key-manual-2",
+            true,
+            "{}",
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "source": "manual",
+                    "credential_fingerprint": "fp-manual"
+                }
+            })),
+        );
+        assert!(!is_runtime_quota_exhausted_revisit_key(&manual_source));
+
+        let suspected_only = sample_pool_key(
+            "provider-codex",
+            "key-suspected",
+            true,
+            "{}",
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_suspected",
+                    "blocked": false,
+                    "source": "message_fallback",
+                    "credential_fingerprint": "fp-suspected"
+                }
+            })),
+        );
+        assert!(!is_runtime_quota_exhausted_revisit_key(&suspected_only));
+
+        let mut disabled = runtime_http_402.clone();
+        disabled.is_active = false;
+        assert!(!is_runtime_quota_exhausted_revisit_key(&disabled));
+
+        let mut oauth_invalid = runtime_http_402;
+        oauth_invalid.oauth_invalid_at_unix_secs = Some(100);
+        oauth_invalid.oauth_invalid_reason = Some("403 forbidden".to_string());
+        assert!(!is_runtime_quota_exhausted_revisit_key(&oauth_invalid));
+    }
+
+    #[tokio::test]
+    async fn perform_account_self_check_once_revisits_only_active_runtime_quota_exhausted_codex_and_antigravity_pool_keys_when_routine_off() {
+        let seen_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
+        let seen_plans_clone = Arc::clone(&seen_plans);
+        let execution_runtime = Router::new().route(
+            "/v1/execute/sync",
+            any(move |Json(plan): Json<ExecutionPlan>| {
+                let seen_plans = Arc::clone(&seen_plans_clone);
+                async move {
+                    let url = plan.url.clone();
+                    seen_plans.lock().expect("mutex should lock").push(plan);
+                    if url.contains("wham/usage") {
+                        Json(json!({
+                            "request_id": "req-codex-quota",
+                            "status_code": 200,
+                            "headers": {"content-type": "application/json"},
+                            "body": {
+                                "json_body": {
+                                    "plan_type": "plus",
+                                    "rate_limit": {
+                                        "allowed": true,
+                                        "limit_reached": false,
+                                        "primary_window": {
+                                            "used_percent": 10,
+                                            "reset_after_seconds": 3600
+                                        }
+                                    }
+                                }
+                            }
+                        }))
+                    } else if url.contains("loadCodeAssist") {
+                        Json(json!({
+                            "request_id": "req-ant-code-assist",
+                            "status_code": 200,
+                            "headers": {"content-type": "application/json"},
+                            "body": {
+                                "json_body": {
+                                    "cloudaicompanionProject": "proj-ant-1"
+                                }
+                            }
+                        }))
+                    } else {
+                        Json(json!({
+                            "request_id": "req-ant-quota",
+                            "status_code": 200,
+                            "headers": {"content-type": "application/json"},
+                            "body": {
+                                "json_body": {
+                                    "models": {
+                                        "claude-sonnet-4-5": {
+                                            "quotaInfo": {
+                                                "remainingFraction": 0.9,
+                                                "resetTime": "2099-01-01T00:00:00Z"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let server_handle = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                execution_runtime.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("server should run");
+        });
+
+        let codex_provider = provider(
+            "codex",
+            Some(json!({
+                "pool_advanced": {
+                    "probing_enabled": false,
+                    "account_self_check_enabled": false
+                }
+            })),
+        );
+        let antigravity_provider = provider(
+            "antigravity",
+            Some(json!({
+                "pool_advanced": {
+                    "probing_enabled": false,
+                    "account_self_check_enabled": false
+                }
+            })),
+        );
+        let claude_provider = provider(
+            "claude_code",
+            Some(json!({
+                "pool_advanced": {
+                    "probing_enabled": false,
+                    "account_self_check_enabled": false
+                }
+            })),
+        );
+
+        let codex_endpoint = StoredProviderCatalogEndpoint::new(
+            "endpoint-codex".to_string(),
+            codex_provider.id.clone(),
+            "openai:responses".to_string(),
+            None,
+            None,
+            true,
+        )
+        .expect("codex endpoint should build")
+        .with_transport_fields(
+            "https://chatgpt.com/backend-api/codex".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("codex endpoint transport should build");
+        let antigravity_endpoint = StoredProviderCatalogEndpoint::new(
+            "endpoint-antigravity".to_string(),
+            antigravity_provider.id.clone(),
+            "gemini:generate_content".to_string(),
+            None,
+            None,
+            true,
+        )
+        .expect("antigravity endpoint should build")
+        .with_transport_fields(
+            "https://cloudcode-pa.googleapis.com".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("antigravity endpoint transport should build");
+        let claude_endpoint = StoredProviderCatalogEndpoint::new(
+            "endpoint-claude".to_string(),
+            claude_provider.id.clone(),
+            "claude:messages".to_string(),
+            None,
+            None,
+            true,
+        )
+        .expect("claude endpoint should build")
+        .with_transport_fields(
+            "https://api.anthropic.com".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("claude endpoint transport should build");
+
+        let codex_runtime_auth = r#"{"access_token":"ya29.codex-runtime","account_id":"acct-codex-1","expires_at":4102444800}"#;
+        let codex_healthy_auth = r#"{"access_token":"ya29.codex-healthy","account_id":"acct-codex-2","expires_at":4102444800}"#;
+        let codex_manual_auth = r#"{"access_token":"ya29.codex-manual","account_id":"acct-codex-3","expires_at":4102444800}"#;
+        let codex_disabled_auth = r#"{"access_token":"ya29.codex-disabled","account_id":"acct-codex-4","expires_at":4102444800}"#;
+        let codex_invalid_auth = r#"{"access_token":"ya29.codex-oauth-invalid","account_id":"acct-codex-5","expires_at":4102444800}"#;
+        let ant_auth = r#"{"access_token":"ya29.ant-runtime","project_id":"proj-ant-1","client_version":"1.18.4","session_id":"session-ant-1","expires_at":4102444800}"#;
+        let claude_auth = r#"{"access_token":"ya29.claude-runtime","expires_at":4102444800}"#;
+
+        let key_codex_runtime = sample_pool_key(
+            &codex_provider.id,
+            "key-codex-runtime",
+            true,
+            codex_runtime_auth,
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "requires_manual_recovery": true,
+                    "source": "http_payment_required",
+                    "credential_fingerprint": "fp-codex-1",
+                    "last_observed_at": 100
+                }
+            })),
+        );
+        let key_codex_healthy = sample_pool_key(
+            &codex_provider.id,
+            "key-codex-healthy",
+            true,
+            codex_healthy_auth,
+            None,
+        );
+        let key_codex_manual = sample_pool_key(
+            &codex_provider.id,
+            "key-codex-manual",
+            true,
+            codex_manual_auth,
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "requires_manual_recovery": true
+                }
+            })),
+        );
+        let key_codex_disabled = sample_pool_key(
+            &codex_provider.id,
+            "key-codex-disabled",
+            false,
+            codex_disabled_auth,
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "source": "http_payment_required",
+                    "credential_fingerprint": "fp-codex-disabled",
+                    "last_observed_at": 100
+                }
+            })),
+        );
+        let mut key_codex_oauth_invalid = sample_pool_key(
+            &codex_provider.id,
+            "key-codex-oauth-invalid",
+            true,
+            codex_invalid_auth,
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "source": "http_payment_required",
+                    "credential_fingerprint": "fp-codex-banned",
+                    "last_observed_at": 100
+                }
+            })),
+        );
+        key_codex_oauth_invalid.oauth_invalid_at_unix_secs = Some(100);
+        key_codex_oauth_invalid.oauth_invalid_reason = Some("403 forbidden".to_string());
+
+        let key_ant_runtime = sample_pool_key(
+            &antigravity_provider.id,
+            "key-ant-runtime",
+            true,
+            ant_auth,
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "requires_manual_recovery": true,
+                    "source": "error_code",
+                    "credential_fingerprint": "fp-ant-1",
+                    "last_observed_at": 100
+                }
+            })),
+        );
+        let key_claude_runtime = sample_pool_key(
+            &claude_provider.id,
+            "key-claude-runtime",
+            true,
+            claude_auth,
+            Some(json!({
+                "scheduling": {
+                    "code": "quota_exhausted",
+                    "blocked": true,
+                    "source": "http_payment_required",
+                    "credential_fingerprint": "fp-claude-1",
+                    "last_observed_at": 100
+                }
+            })),
+        );
+        let catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![
+                codex_provider.clone(),
+                antigravity_provider.clone(),
+                claude_provider.clone(),
+            ],
+            vec![codex_endpoint, antigravity_endpoint, claude_endpoint],
+            vec![
+                key_codex_runtime,
+                key_codex_healthy,
+                key_codex_manual,
+                key_codex_disabled,
+                key_codex_oauth_invalid,
+                key_ant_runtime,
+                key_claude_runtime,
+            ],
+        ));
+        let scores = Arc::new(InMemoryPoolMemberScoreRepository::seed([
+            sample_pool_score(
+                &codex_provider.id,
+                "key-codex-runtime",
+                PoolMemberHardState::QuotaExhausted,
+                json!({"hard_state_source": "runtime_quota_exhaustion"}),
+            ),
+            sample_pool_score(
+                &codex_provider.id,
+                "key-codex-healthy",
+                PoolMemberHardState::Available,
+                json!({}),
+            ),
+            sample_pool_score(
+                &codex_provider.id,
+                "key-codex-manual",
+                PoolMemberHardState::QuotaExhausted,
+                json!({"hard_state_source": "runtime_quota_exhaustion"}),
+            ),
+            sample_pool_score(
+                &antigravity_provider.id,
+                "key-ant-runtime",
+                PoolMemberHardState::QuotaExhausted,
+                json!({"hard_state_source": "runtime_quota_exhaustion"}),
+            ),
+        ]));
+        let data = GatewayDataState::with_provider_catalog_repository_for_tests(catalog)
+            .with_pool_score_repository_for_tests(Arc::clone(&scores))
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+        let state = AppState::new()
+            .expect("gateway should build")
+            .with_execution_runtime_override_base_url(format!("http://{addr}"))
+            .with_data_state_for_tests(data);
+
+        let summary = perform_account_self_check_once(&state)
+            .await
+            .expect("account self-check should succeed");
+
+        server_handle.abort();
+
+        assert_eq!(summary.providers_checked, 2);
+        assert_eq!(summary.providers_checked_with_keys, 2);
+        assert_eq!(summary.selected_keys, 2);
+        assert_eq!(summary.scanned_keys, 2);
+        assert_eq!(summary.succeeded, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.blocked, 0);
+
+        let plans = seen_plans.lock().expect("mutex should lock");
+        assert!(plans.iter().any(|plan| plan.url.contains("wham/usage")));
+        assert!(plans
+            .iter()
+            .any(|plan| plan.url.contains("fetchAvailableModels")));
+        let urls = plans.iter().map(|plan| plan.url.as_str()).collect::<Vec<_>>();
+        assert!(
+            plans.iter().all(|plan| {
+                plan.url.contains("wham/usage")
+                    || plan.url.contains("wham/rate-limit-reset-credits")
+                    || plan.url.contains("loadCodeAssist")
+                    || plan.url.contains("fetchAvailableModels")
+                    || plan.url.contains("retrieveUserQuota")
+            }),
+            "unexpected quota refresh urls: {urls:?}"
+        );
+        let auth_headers = plans
+            .iter()
+            .filter_map(|plan| {
+                plan.headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert!(auth_headers.contains(&"Bearer ya29.key-codex-runtime"));
+        assert!(auth_headers.contains(&"Bearer ya29.key-ant-runtime"));
+        assert!(auth_headers.iter().all(|header| {
+            *header == "Bearer ya29.key-codex-runtime" || *header == "Bearer ya29.key-ant-runtime"
+        }));
+
+        let stored_scores = state
+            .data
+            .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+                ids: vec![
+                    "score-key-codex-runtime".to_string(),
+                    "score-key-codex-manual".to_string(),
+                    "score-key-codex-healthy".to_string(),
+                    "score-key-ant-runtime".to_string(),
+                ],
+            })
+            .await
+            .expect("scores should load");
+        for score in stored_scores {
+            assert_eq!(score.probe_status, PoolMemberProbeStatus::Never);
+            assert!(score.score_reason.get("last_probe").is_none());
+        }
     }
 }

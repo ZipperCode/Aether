@@ -6,6 +6,7 @@ import {
   getGenericQuotaSections,
   getGeminiCliAccountCreditsText,
   getGenericQuotaStatusTitle,
+  getQuotaExhaustedSchedulingLabel,
   getQuotaDisplayText,
   getQuotaQueryStatusLabel,
   getQuotaStatusBadgeInfo,
@@ -609,5 +610,31 @@ describe('providerKeyQuota', () => {
     expect(groups[0].stale).toBe(true)
     expect(groups[0].balances[0].available).toBe('25.00 CNY')
     expect(getQuotaDisplayText({ status_snapshot: { quota } } as never, 'deepseek')).toBe('可用余额 25.00 CNY')
+  })
+
+  it('uses neutral 额度耗尽 and 可刷新额度核对 for Codex/Antigravity runtime holds while preserving manual recovery for other providers', () => {
+    expect(getQuotaStatusBadgeInfo('额度耗尽')?.tone).toBe('destructive')
+    expect(getQuotaStatusBadgeInfo('额度耗尽')?.variant).toBe('destructive')
+
+    expect(getQuotaExhaustedSchedulingLabel('codex', true)).toBe('额度耗尽')
+    expect(getQuotaExhaustedSchedulingLabel('antigravity', true)).toBe('额度耗尽')
+    expect(getQuotaExhaustedSchedulingLabel('claude_code', true)).toBe('额度耗尽·需人工恢复')
+    expect(getQuotaExhaustedSchedulingLabel('codex', false)).toBe('额度耗尽·需人工恢复')
+
+    const codexTitle = getGenericQuotaStatusTitle({
+      providerType: 'codex',
+      isActive: true,
+      scheduling: { code: 'quota_exhausted', blocked: true, reason: '5h window exhausted' },
+    })
+    expect(codexTitle).toContain('额度耗尽')
+    expect(codexTitle).toContain('可刷新额度核对')
+    expect(codexTitle).not.toContain('需人工恢复')
+
+    const claudeTitle = getGenericQuotaStatusTitle({
+      providerType: 'claude_code',
+      isActive: true,
+      scheduling: { code: 'quota_exhausted', blocked: true },
+    })
+    expect(claudeTitle).toBe('额度耗尽·需人工恢复')
   })
 })

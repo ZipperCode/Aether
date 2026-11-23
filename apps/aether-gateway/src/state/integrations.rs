@@ -5,8 +5,8 @@ use aether_data_contracts::repository::candidates::{
     StoredRequestCandidate, UpsertRequestCandidateRecord,
 };
 use aether_data_contracts::repository::global_models::{
-    AdminGlobalModelListQuery, AdminProviderModelListQuery,
-    CreateAdminProviderModelWithBindingsRecord, StoredAdminGlobalModelPage,
+    AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
+    CreateAdminProviderModelWithBindingsRecord, StoredAdminGlobalModel, StoredAdminGlobalModelPage,
     StoredAdminProviderModel, StoredModelEndpointBinding, UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::repository::provider_catalog::{
@@ -485,6 +485,23 @@ impl CodexCatalogRuntime for AppState {
         self.runtime_state.as_ref()
     }
 
+    fn schedule_managed_catalog_refresh(&self, provider_id: &str, key_id: &str) {
+        let state = self.clone();
+        let (provider_id, key_id) = (provider_id.to_owned(), key_id.to_owned());
+        crate::task_runtime::spawn_fire_and_forget(
+            crate::task_runtime::TASK_KEY_MODEL_FETCH_WORKER,
+            async move {
+                if let Err(error) =
+                    crate::model_fetch::perform_model_fetch_for_key(&state, &provider_id, &key_id)
+                        .await
+                {
+                    tracing::warn!(%provider_id, %key_id, error = %crate::model_fetch::safe_model_fetch_error(&error.into_message()),
+                    "could not refresh managed models after a Codex catalog change");
+                }
+            },
+        );
+    }
+
     async fn read_codex_catalog_transport_snapshot(
         &self,
         provider_id: &str,
@@ -760,6 +777,24 @@ impl ModelFetchAssociationStore for AppState {
         query: &AdminGlobalModelListQuery,
     ) -> Result<StoredAdminGlobalModelPage, Self::Error> {
         AppState::list_admin_global_models(self, query)
+            .await
+            .map_err(|err| format!("{err:?}"))
+    }
+
+    async fn get_admin_global_model_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<StoredAdminGlobalModel>, Self::Error> {
+        AppState::get_admin_global_model_by_name(self, name)
+            .await
+            .map_err(|err| format!("{err:?}"))
+    }
+
+    async fn create_admin_global_model(
+        &self,
+        record: &CreateAdminGlobalModelRecord,
+    ) -> Result<Option<StoredAdminGlobalModel>, Self::Error> {
+        AppState::create_admin_global_model(self, record)
             .await
             .map_err(|err| format!("{err:?}"))
     }

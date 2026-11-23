@@ -6,8 +6,9 @@ use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY}
 use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data_contracts::repository::global_models::{
-    AdminProviderModelListQuery, GlobalModelReadRepository, StoredAdminGlobalModel,
-    StoredAdminProviderModel, StoredModelEndpointBinding,
+    AdminGlobalModelListQuery, AdminProviderModelListQuery, GlobalModelReadRepository,
+    GlobalModelWriteRepository, StoredAdminGlobalModel, StoredAdminProviderModel,
+    StoredModelEndpointBinding,
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
@@ -1415,5 +1416,572 @@ async fn codex_model_discovery_fetches_account_specific_oauth_catalogs() {
         Some(&json!({
             "model_ids": ["gpt-basic-test", "gpt-6.1-sol"]
         }))
+    );
+}
+#[tokio::test]
+async fn auto_publish_discovered_models_publishes_filtered_discovered_ids_and_keeps_flag_off_behavior() {
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(|| async {
+            Json(json!({
+                "request_id": "req-auto-publish-filter",
+                "status_code": 200,
+                "headers": { "content-type": "application/json" },
+                "body": {
+                    "json_body": {
+                        "data": [
+                            {"id": "gpt-5.2"},
+                            {"id": "gpt-beta"},
+                            {"id": "other-model"}
+                        ]
+                    }
+                }
+            }))
+        }),
+    );
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+
+    let mut provider_off = sample_provider("provider-off");
+    provider_off.config = Some(json!({
+        "pool_advanced": { "auto_publish_discovered_models": false }
+    }));
+    let mut provider_on = sample_provider("provider-on");
+    provider_on.config = Some(json!({
+        "pool_advanced": { "auto_publish_discovered_models": true }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider_off, provider_on],
+        vec![
+            sample_endpoint("provider-off", "ep-off", "https://api.openai.example"),
+            sample_endpoint("provider-on", "ep-on", "https://api.openai.example"),
+        ],
+        vec![
+            sample_key("provider-off", "key-off"),
+            sample_key("provider-on", "key-on"),
+        ],
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new()).with_endpoint_provider_ids([
+            ("ep-off", "provider-off"),
+            ("ep-on", "provider-on"),
+        ]),
+    );
+    let data_state = crate::data::GatewayDataState::disabled()
+        .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
+        .with_global_model_repository_for_tests(Arc::clone(&global_model_repository))
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(data_state);
+
+    let summary = perform_model_fetch_once(&state)
+        .await
+        .expect("model fetch should succeed");
+    execution_runtime_handle.abort();
+    assert_eq!(summary.succeeded, 2);
+
+    let globals = global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            offset: 0,
+            limit: 100,
+            is_active: None,
+            search: None,
+        })
+        .await
+        .expect("globals should list")
+        .items;
+    assert_eq!(globals.len(), 1);
+    assert_eq!(globals[0].name, "gpt-5.2");
+    assert!(globals[0].is_active);
+    assert_eq!(
+        globals[0].default_tiered_pricing,
+        Some(json!({
+            "tiers": [{
+                "up_to": null,
+                "input_price_per_1m": 0.0,
+                "output_price_per_1m": 0.0,
+            }]
+        }))
+    );
+
+    let off_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-off".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("off provider models should list");
+    assert!(off_models.is_empty());
+
+    let on_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-on".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("on provider models should list");
+    assert_eq!(on_models.len(), 1);
+    assert_eq!(on_models[0].provider_model_name, "gpt-5.2");
+    assert!(on_models[0].is_active);
+    assert!(on_models[0].is_available);
+
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&[on_models[0].id.clone()])
+        .await
+        .expect("bindings should list");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, "ep-on");
+    assert_eq!(bindings[0].source, "discovered");
+    assert!(bindings[0].is_active);
+}
+
+#[tokio::test]
+async fn auto_publish_discovered_models_respects_per_account_gates() {
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(|Json(plan): Json<ExecutionPlan>| async move {
+            let url = plan.url.as_str();
+            if url.contains("fail.example") {
+                return Json(json!({
+                    "request_id": "req-fail",
+                    "status_code": 500,
+                    "headers": { "content-type": "application/json" },
+                    "body": { "json_body": { "error": "upstream error" } }
+                }));
+            }
+            Json(json!({
+                "request_id": "req-ok",
+                "status_code": 200,
+                "headers": { "content-type": "application/json" },
+                "body": {
+                    "json_body": {
+                        "data": [
+                            {"id": "gpt-allowed"},
+                            {"id": "gpt-excluded"}
+                        ]
+                    }
+                }
+            }))
+        }),
+    );
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+
+    let mut provider = sample_provider("provider-gated");
+    provider.config = Some(json!({
+        "pool_advanced": { "auto_publish_discovered_models": true }
+    }));
+    let mut preset_provider = sample_provider("provider-preset");
+    preset_provider.provider_type = "gemini_cli".to_string();
+    preset_provider.config = Some(json!({
+        "pool_advanced": { "auto_publish_discovered_models": true }
+    }));
+
+    let mut ep_chat = sample_endpoint("provider-gated", "ep-chat", "https://ok.example");
+    ep_chat.api_format = "openai:chat".to_string();
+    let mut ep_resp = sample_endpoint("provider-gated", "ep-resp", "https://fail.example");
+    ep_resp.api_format = "openai:responses".to_string();
+
+    let mut key_inactive = sample_key("provider-gated", "key-inactive");
+    key_inactive.is_active = false;
+    key_inactive.model_include_patterns = None;
+    key_inactive.model_exclude_patterns = None;
+
+    let mut key_no_autofetch = sample_key("provider-gated", "key-no-autofetch");
+    key_no_autofetch.auto_fetch_models = false;
+    key_no_autofetch.model_include_patterns = None;
+    key_no_autofetch.model_exclude_patterns = None;
+
+    let mut key_failed = sample_key("provider-gated", "key-failed");
+    key_failed.api_formats = Some(json!(["openai:responses"]));
+    key_failed.model_include_patterns = None;
+    key_failed.model_exclude_patterns = None;
+
+    let mut key_active = sample_key("provider-gated", "key-active");
+    key_active.api_formats = Some(json!(["openai:chat"]));
+    key_active.model_include_patterns = Some(json!(["gpt-allowed"]));
+    key_active.model_exclude_patterns = Some(json!(["gpt-excluded"]));
+
+    let mut key_preset = sample_key("provider-preset", "key-preset");
+    key_preset.locked_models = None;
+    key_preset.model_include_patterns = None;
+    key_preset.model_exclude_patterns = None;
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider, preset_provider],
+        vec![ep_chat, ep_resp],
+        vec![key_inactive, key_no_autofetch, key_failed, key_active, key_preset],
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new()).with_endpoint_provider_ids([
+            ("ep-chat", "provider-gated"),
+            ("ep-resp", "provider-gated"),
+        ]),
+    );
+    let data_state = crate::data::GatewayDataState::disabled()
+        .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
+        .with_global_model_repository_for_tests(Arc::clone(&global_model_repository))
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(data_state);
+
+    let summary = perform_model_fetch_once(&state)
+        .await
+        .expect("model fetch should complete");
+    execution_runtime_handle.abort();
+    assert_eq!(summary.attempted, 3);
+    assert_eq!(summary.succeeded, 2);
+    assert_eq!(summary.failed, 1);
+
+    let globals = global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            offset: 0,
+            limit: 100,
+            is_active: None,
+            search: None,
+        })
+        .await
+        .expect("globals should list")
+        .items;
+    assert_eq!(globals.len(), 1);
+    assert_eq!(globals[0].name, "gpt-allowed");
+
+    let models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-gated".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("provider models should list");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].provider_model_name, "gpt-allowed");
+    let bindings = global_model_repository
+        .list_model_endpoint_bindings(&[models[0].id.clone()])
+        .await
+        .expect("bindings should list");
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].endpoint_id, "ep-chat");
+
+    let preset_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-preset".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("preset provider models should list");
+    assert!(preset_models.is_empty());
+}
+
+#[tokio::test]
+async fn auto_publish_discovered_models_respects_disabled_records_aliases_and_admin_pricing() {
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(|| async {
+            Json(json!({
+                "request_id": "req-auto-publish-respect",
+                "status_code": 200,
+                "headers": { "content-type": "application/json" },
+                "body": {
+                    "json_body": {
+                        "data": [
+                            {"id": "disabled-global"},
+                            {"id": "disabled-alias-2"},
+                            {"id": "disabled-pm"},
+                            {"id": "upstream-alias-1"},
+                            {"id": "mapped-upstream-1"},
+                            {"id": "brand-new"}
+                        ]
+                    }
+                }
+            }))
+        }),
+    );
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+
+    let mut provider = sample_provider("provider-respect");
+    provider.config = Some(json!({
+        "pool_advanced": { "auto_publish_discovered_models": true }
+    }));
+    let mut ep_chat = sample_endpoint("provider-respect", "ep-chat", "https://api.openai.example");
+    ep_chat.api_format = "openai:chat".to_string();
+    let mut ep_claude = sample_endpoint("provider-respect", "ep-claude", "https://api.openai.example");
+    ep_claude.api_format = "claude:messages".to_string();
+
+    let mut key = sample_key("provider-respect", "key-respect");
+    key.api_formats = Some(json!(["openai:chat", "claude:messages"]));
+    key.locked_models = None;
+    key.model_include_patterns = None;
+    key.model_exclude_patterns = None;
+
+    let mut disabled_global = sample_global_model(
+        "gm-disabled",
+        "disabled-global",
+        &["disabled-alias-.*"],
+    );
+    disabled_global.is_active = false;
+
+    let mut existing_global = sample_global_model("gm-existing", "existing-global", &[]);
+    existing_global.default_price_per_request = Some(0.99);
+
+    let mapped_global = sample_global_model("gm-mapped", "mapped-global", &["mapped-upstream-.*"]);
+
+    let mut disabled_pm = sample_provider_model(
+        "pm-disabled",
+        "provider-respect",
+        "gm-existing",
+        "disabled-pm",
+        "existing-global",
+        &[],
+    );
+    disabled_pm.is_active = false;
+
+    let custom_tiered = json!({
+        "tiers": [{
+            "up_to": null,
+            "input_price_per_1m": 12.5,
+            "output_price_per_1m": 37.5,
+        }]
+    });
+    let mut existing_aliased_pm = sample_provider_model(
+        "pm-aliased",
+        "provider-respect",
+        "gm-existing",
+        "existing-aliased",
+        "existing-global",
+        &[],
+    );
+    existing_aliased_pm.provider_model_mappings = Some(json!([{ "name": "upstream-alias-1" }]));
+    existing_aliased_pm.price_per_request = Some(0.42);
+    existing_aliased_pm.tiered_pricing = Some(custom_tiered.clone());
+
+    let disabled_binding = StoredModelEndpointBinding::new(
+        "pm-aliased".to_string(),
+        "ep-chat".to_string(),
+        "discovered".to_string(),
+        false,
+        None,
+        None,
+    )
+    .expect("disabled binding should build");
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![ep_chat, ep_claude],
+        vec![key],
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![disabled_global, existing_global, mapped_global])
+            .with_admin_provider_models(vec![disabled_pm, existing_aliased_pm])
+            .with_endpoint_provider_ids([
+                ("ep-chat", "provider-respect"),
+                ("ep-claude", "provider-respect"),
+            ]),
+    );
+    global_model_repository
+        .upsert_model_endpoint_binding(
+            &aether_data_contracts::repository::global_models::UpsertModelEndpointBindingRecord::new(
+                disabled_binding.model_id,
+                disabled_binding.endpoint_id,
+                disabled_binding.source,
+                disabled_binding.is_active,
+            )
+            .expect("upsert binding record should build"),
+        )
+        .await
+        .expect("disabled binding should seed");
+
+    let data_state = crate::data::GatewayDataState::disabled()
+        .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
+        .with_global_model_repository_for_tests(Arc::clone(&global_model_repository))
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(data_state);
+
+    let summary = perform_model_fetch_once(&state)
+        .await
+        .expect("model fetch should succeed");
+    assert_eq!(summary.succeeded, 1);
+    let repeat_summary = perform_model_fetch_once(&state)
+        .await
+        .expect("repeat model fetch should remain idempotent");
+    execution_runtime_handle.abort();
+    assert_eq!(repeat_summary.succeeded, 1);
+
+    let globals = global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            offset: 0,
+            limit: 100,
+            is_active: None,
+            search: None,
+        })
+        .await
+        .expect("globals should list")
+        .items;
+    assert_eq!(globals.len(), 4);
+    assert!(globals
+        .iter()
+        .find(|g| g.id == "gm-disabled")
+        .is_some_and(|g| !g.is_active));
+    assert!(!globals.iter().any(|g| g.name == "disabled-alias-2"));
+    assert!(!globals.iter().any(|g| g.name == "upstream-alias-1"));
+    assert!(!globals.iter().any(|g| g.name == "mapped-upstream-1"));
+    assert!(globals.iter().any(|g| g.name == "brand-new" && g.is_active));
+
+    let pms = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-respect".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("provider models should list");
+    assert_eq!(pms.len(), 4);
+    assert!(pms
+        .iter()
+        .find(|m| m.id == "pm-disabled")
+        .is_some_and(|m| !m.is_active));
+    let aliased = pms
+        .iter()
+        .find(|m| m.id == "pm-aliased")
+        .expect("aliased pm should exist");
+    assert_eq!(aliased.price_per_request, Some(0.42));
+    assert_eq!(aliased.tiered_pricing, Some(custom_tiered));
+    assert!(pms
+        .iter()
+        .any(|m| m.provider_model_name == "mapped-global" && m.global_model_id == "gm-mapped"));
+    assert!(pms.iter().any(|m| m.provider_model_name == "brand-new"));
+
+    let aliased_bindings = global_model_repository
+        .list_model_endpoint_bindings(&["pm-aliased".to_string()])
+        .await
+        .expect("aliased bindings should list");
+    assert!(aliased_bindings
+        .iter()
+        .find(|b| b.endpoint_id == "ep-chat")
+        .is_some_and(|b| !b.is_active));
+    assert!(aliased_bindings
+        .iter()
+        .find(|b| b.endpoint_id == "ep-claude")
+        .is_some_and(|b| b.is_active));
+}
+
+#[tokio::test]
+async fn auto_publish_discovered_models_skips_supplemented_codex_image_models() {
+    let upstream = Router::new().route(
+        "/backend-api/codex/models",
+        any(|| async {
+            Json(json!({
+                "models": [{
+                    "slug": "gpt-basic-test",
+                    "family": "gpt-basic",
+                    "display_name": "GPT Basic Test",
+                    "visibility": "list"
+                }]
+            }))
+        }),
+    );
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let base_url = format!("{}/backend-api/codex", upstream_url.trim_end_matches('/'));
+    let mut provider = codex_image_sample_provider("provider-codex-autopublish");
+    provider.config = Some(json!({
+        "pool_advanced": { "auto_publish_discovered_models": true }
+    }));
+    let endpoints = vec![
+        codex_image_sample_endpoint(
+            "endpoint-codex-responses",
+            "provider-codex-autopublish",
+            "openai:responses",
+            &base_url,
+        ),
+        codex_image_sample_endpoint(
+            "endpoint-codex-image",
+            "provider-codex-autopublish",
+            "openai:image",
+            &base_url,
+        ),
+    ];
+    let key = codex_oauth_sample_key(
+        "key-codex-paid", "provider-codex-autopublish", &["openai:responses", "openai:image"],
+        "synthetic-codex-oauth-paid",
+        json!({"provider_type":"codex","account_id":"acct-codex-paid","plan_type":"plus","expires_at":4_102_444_800u64}),
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        endpoints,
+        vec![key],
+    ));
+    let global_model_repository = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models(vec![sample_global_model(
+                "global-model-image",
+                "gpt-image-alias",
+                &["gpt-image-alias"],
+            )])
+            .with_admin_provider_models(vec![sample_provider_model(
+                "provider-model-image",
+                "provider-codex-autopublish",
+                "global-model-image",
+                "gpt-image-next-release",
+                "gpt-image-alias",
+                &["gpt-image-alias"],
+            )])
+            .with_model_endpoint_bindings([StoredModelEndpointBinding::new(
+                "provider-model-image".to_string(),
+                "endpoint-codex-image".to_string(),
+                "discovered".to_string(),
+                true,
+                None,
+                None,
+            )
+            .expect("image binding should build")])
+            .with_endpoint_provider_ids([
+                ("endpoint-codex-responses", "provider-codex-autopublish"),
+                ("endpoint-codex-image", "provider-codex-autopublish"),
+            ]),
+    );
+    let data_state = crate::data::GatewayDataState::disabled()
+        .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
+        .with_global_model_repository_for_tests(Arc::clone(&global_model_repository))
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state);
+
+    let summary = perform_model_fetch_once(&state)
+        .await
+        .expect("codex model fetch should succeed");
+    upstream_handle.abort();
+    assert_eq!(summary.succeeded, 1);
+
+    let globals = global_model_repository
+        .list_admin_global_models(&AdminGlobalModelListQuery {
+            offset: 0,
+            limit: 100,
+            is_active: None,
+            search: None,
+        })
+        .await
+        .expect("globals should list")
+        .items;
+    assert_eq!(globals.len(), 2);
+    assert!(globals.iter().any(|g| g.name == "gpt-basic-test"));
+    assert!(!globals.iter().any(|g| g.name == "gpt-image-next-release"));
+
+    let updated_keys = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-paid".to_string()])
+        .await
+        .expect("updated codex key should list");
+    assert_eq!(
+        updated_keys[0].allowed_models,
+        Some(json!(["gpt-basic-test", "gpt-image-next-release"]))
     );
 }

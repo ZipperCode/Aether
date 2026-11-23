@@ -138,7 +138,7 @@ impl AntigravityUpstreamErrorFixture {
             AntigravityUpstreamErrorKind::GenericForbidden => json!({"error": {
                 "code": 403,
                 "status": "PERMISSION_DENIED",
-                "message": "Permission denied for the requested project"
+                "message": "Access denied for the requested project"
             }}),
         }
     }
@@ -4374,6 +4374,7 @@ async fn gateway_antigravity_runtime_generic_403_uses_transient_cooldown_without
     let mut config = antigravity_runtime_quota_http_config("generic-403-pool", true);
     config.key_b.models = antigravity_runtime_quota_models(0.9);
     let harness = start_antigravity_http_harness(config).await;
+    harness.materialize_pool_scores().await;
     let body = json!({
         "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
         "generationConfig": {"temperature": 0.2, "thinkingConfig": {"thinkingLevel": "HIGH"}},
@@ -4413,6 +4414,38 @@ async fn gateway_antigravity_runtime_generic_403_uses_transient_cooldown_without
         crate::handlers::shared::provider_key_status_snapshot_payload(&failed, "antigravity");
     assert_eq!(snapshot["account"]["blocked"], false);
     assert!(snapshot["account"].get("validation_url").is_none());
+    let read_account = || async {
+        let list = harness
+            .client
+            .get(format!(
+                "{}/api/admin/pool/{}/keys",
+                harness.gateway_url, harness.provider_id
+            ))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-quota-test")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "admin-session-quota-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        list["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["key_id"] == harness.key_a_id)
+            .unwrap()
+            .clone()
+    };
+    let account = read_account().await;
+    assert_eq!(account["cooldown_reason"], "forbidden_403");
+    let last = &account["last_inference_rejection"];
+    assert!(last["retry_at"].as_u64().unwrap() > last["observed_at"].as_u64().unwrap());
+    assert_eq!(account["pool_score"]["hard_state"], "cooldown");
 
     let counts = harness.generation_counts();
     let a_before = counts
@@ -4439,6 +4472,65 @@ async fn gateway_antigravity_runtime_generic_403_uses_transient_cooldown_without
         .await
         .oauth_invalid_reason
         .is_none());
+    let cleared = harness
+        .send_admin_post(&format!(
+            "/api/admin/providers/{}/pool/clear-cooldown/{}",
+            harness.provider_id, harness.key_a_id
+        ))
+        .await;
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let eligible = read_account().await;
+    assert!(eligible["cooldown_reason"].is_null());
+    assert_eq!(&eligible["last_inference_rejection"], last);
+}
+
+#[test]
+fn gateway_antigravity_positive_refresh_releases_runtime_quota_hold() {
+    run_gemini_cli_sync_test(
+        "gateway_antigravity_positive_refresh_releases_runtime_quota_hold",
+        || async {
+            let harness = start_antigravity_http_harness(antigravity_runtime_quota_http_config(
+                "recover-held",
+                true,
+            ))
+            .await;
+            let key = harness.read_catalog_key(&harness.key_a_id).await;
+            let now = current_unix_secs();
+            assert!(harness.gateway_state.compare_and_update_provider_catalog_key_scheduling_state(&ProviderCatalogKeySchedulingStateCasUpdate {
+            key_id: key.id.clone(), expected_encrypted_api_key: key.encrypted_api_key,
+            expected_encrypted_auth_config: key.encrypted_auth_config, expected_auth_type: key.auth_type,
+            expected_scheduling: None, scheduling: Some(json!({"code":"quota_exhausted", "blocked":true,
+                "credential_fingerprint":"observed", "source":"status_code", "last_observed_at": now - 1})), updated_at_unix_secs: Some(now),
+        }).await.unwrap());
+            assert_eq!(
+                harness
+                    .send_refresh_quota(Some(json!({"key_ids":[key.id]})))
+                    .await["success"],
+                1
+            );
+            assert!(
+                !aether_provider_pool::provider_pool_key_runtime_quota_blocked(
+                    &harness.read_catalog_key(&key.id).await
+                )
+            );
+            let body = json!({
+                "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+                "generationConfig": {"temperature": 0.2, "thinkingConfig": {"thinkingLevel": "HIGH"}},
+                "session_id": harness.client_session_id
+            });
+            assert_reset_only_serving_step(
+                &harness,
+                "restored",
+                ANTIGRAVITY_RUNTIME_PRIMARY_GLOBAL_MODEL,
+                ANTIGRAVITY_RUNTIME_PRIMARY_MODEL,
+                &body,
+                false,
+                StatusCode::OK,
+                (1, 0),
+            )
+            .await;
+        },
+    );
 }
 
 #[test]

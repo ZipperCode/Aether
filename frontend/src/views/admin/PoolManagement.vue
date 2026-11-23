@@ -322,6 +322,7 @@
                           class="text-[10px] cursor-help"
                           :class="keyUiStateMap[key.key_id]?.modelFetchClass"
                           :title="keyUiStateMap[key.key_id]?.modelFetchTitle"
+                          :data-testid="`pool-key-model-fetch-desktop-${key.key_id}`"
                         >
                           {{ keyUiStateMap[key.key_id]?.modelFetchLabel }}
                         </span>
@@ -335,6 +336,14 @@
                         </span>
                         <PoolKeyHealthIndicator :score="key.health_score" />
                       </div>
+                      <p
+                        v-if="keyUiStateMap[key.key_id]?.modelFetchHint"
+                        class="mt-0.5 text-[10px] leading-4"
+                        :class="keyUiStateMap[key.key_id]?.modelFetchClass"
+                        :data-testid="`pool-key-model-fetch-hint-desktop-${key.key_id}`"
+                      >
+                        {{ keyUiStateMap[key.key_id]?.modelFetchHint }}
+                      </p>
                     </div>
                   </div>
                 </TableCell>
@@ -390,14 +399,22 @@
                     />
                   </div>
                 </TableCell>
-                <TableCell class="py-3 text-center align-top">
-                  <Badge
-                    :variant="keyUiStateMap[key.key_id]?.schedulingBadgeVariant || 'default'"
-                    class="text-[10px]"
-                    :title="keyUiStateMap[key.key_id]?.schedulingTitle || ''"
-                  >
-                    {{ keyUiStateMap[key.key_id]?.schedulingBadgeLabel }}
-                  </Badge>
+                <TableCell class="py-3 px-2 text-center align-top">
+                  <div class="flex flex-col items-center gap-1">
+                    <Badge
+                      :variant="keyUiStateMap[key.key_id]?.schedulingBadgeVariant || 'default'"
+                      class="text-[10px] whitespace-nowrap"
+                      :title="keyUiStateMap[key.key_id]?.schedulingTitle || ''"
+                      :data-testid="`pool-key-status-badge-desktop-${key.key_id}`"
+                    >
+                      {{ keyUiStateMap[key.key_id]?.schedulingBadgeLabel }}
+                    </Badge>
+                    <PoolKeyInferenceRejectionNote
+                      :key-id="key.key_id"
+                      :rejection="keyUiStateMap[key.key_id]?.antigravityInferenceRejection"
+                      variant="desktop"
+                    />
+                  </div>
                 </TableCell>
                 <TableCell class="py-3 px-2 align-top">
                   <PoolKeyActionButtons
@@ -468,6 +485,7 @@
                   :variant="keyUiStateMap[key.key_id]?.schedulingBadgeVariant || 'default'"
                   class="text-[10px] shrink-0"
                   :title="keyUiStateMap[key.key_id]?.schedulingTitle || ''"
+                  :data-testid="`pool-key-status-badge-mobile-${key.key_id}`"
                 >
                   {{ keyUiStateMap[key.key_id]?.schedulingBadgeLabel }}
                 </Badge>
@@ -476,6 +494,7 @@
                   class="inline-flex max-w-full items-center rounded-full border px-2 py-0.5 text-[10px] font-medium leading-4 cursor-help"
                   :class="keyUiStateMap[key.key_id]?.modelFetchClass"
                   :title="keyUiStateMap[key.key_id]?.modelFetchTitle"
+                  :data-testid="`pool-key-model-fetch-mobile-${key.key_id}`"
                 >
                   {{ keyUiStateMap[key.key_id]?.modelFetchLabel }}
                 </span>
@@ -489,7 +508,7 @@
                 </span>
                 <PoolKeyHealthIndicator :score="key.health_score" />
                 <span
-                  v-if="key.cooldown_ttl_seconds"
+                  v-if="key.cooldown_ttl_seconds && keyUiStateMap[key.key_id]?.antigravityInferenceRejection?.mode !== 'cooldown'"
                   class="inline-flex items-center rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-[10px] font-medium leading-4 text-red-700 dark:text-red-300"
                 > {{ t('ui.cooldown') }} {{ formatTTL(key.cooldown_ttl_seconds) }}
                 </span>
@@ -533,6 +552,19 @@
                   </span>
                 </template>
               </div>
+              <p
+                v-if="keyUiStateMap[key.key_id]?.modelFetchHint"
+                class="text-[11px] leading-4"
+                :class="keyUiStateMap[key.key_id]?.modelFetchClass"
+                :data-testid="`pool-key-model-fetch-hint-mobile-${key.key_id}`"
+              >
+                {{ keyUiStateMap[key.key_id]?.modelFetchHint }}
+              </p>
+              <PoolKeyInferenceRejectionNote
+                :key-id="key.key_id"
+                :rejection="keyUiStateMap[key.key_id]?.antigravityInferenceRejection"
+                variant="mobile"
+              />
 
               <div class="overflow-x-auto rounded-xl border border-border/50 bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
                 <div class="space-y-1 text-center">
@@ -842,6 +874,7 @@ import PoolManagementHeader from '@/features/pool/components/PoolManagementHeade
 import PoolKeyQuotaPanel from '@/features/pool/components/PoolKeyQuotaPanel.vue'
 import PoolKeyStatsPanel from '@/features/pool/components/PoolKeyStatsPanel.vue'
 import PoolKeyHealthIndicator from '@/features/pool/components/PoolKeyHealthIndicator.vue'
+import PoolKeyInferenceRejectionNote from '@/features/pool/components/PoolKeyInferenceRejectionNote.vue'
 import PoolKeyScorePopover from '@/features/pool/components/PoolKeyScorePopover.vue'
 import PoolKeyActionButtons from '@/features/pool/components/PoolKeyActionButtons.vue'
 import KeyAllowedModelsEditDialog from '@/features/providers/components/KeyAllowedModelsEditDialog.vue'
@@ -872,7 +905,11 @@ import {
   type PoolStatsMetric,
 } from '@/features/pool/utils/poolStatsDisplay'
 import { resetCodexCycleUsageWindows } from '@/features/pool/utils/poolCycleStats'
-import { mergePoolKeyQuotaSnapshots } from '@/features/pool/utils/poolQuotaRefresh'
+import {
+  isRuntimeQuotaExhaustedPoolKey,
+  mergePoolKeyQuotaSnapshots,
+  shouldReloadPoolPageAfterQuotaRefresh,
+} from '@/features/pool/utils/poolQuotaRefresh'
 import { resolveAntigravityAccountTierLabel } from '@/features/providers/utils/antigravityQuota'
 import {
   getQuotaProgressLabel,
@@ -890,6 +927,8 @@ import {
 } from '@/features/pool/utils/poolKeyQuotaProgress'
 import type { QuotaProgressItem, QuotaProgressDisplayItem } from '@/features/pool/utils/poolKeyQuotaProgress'
 import {
+  getAntigravityInferenceRejectionDisplay,
+  getPoolKeyModelFetchDisplay,
   getSchedulingBadgeLabel,
   getSchedulingBadgeVariant,
   getSchedulingTitle,
@@ -906,7 +945,10 @@ import {
   formatRelativeTime,
   formatPoolKeyImportedAt,
 } from '@/features/pool/utils/poolKeyStatus'
-import type { PoolStatusVariant } from '@/features/pool/utils/poolKeyStatus'
+import type {
+  AntigravityInferenceRejectionDisplay,
+  PoolStatusVariant,
+} from '@/features/pool/utils/poolKeyStatus'
 import {
   clearPendingCodexResetCreditIdempotencyKey,
   clearPendingCodexResetCreditIdempotencyKeyForOutcome,
@@ -1450,14 +1492,26 @@ const showAccountQuotaColumn = computed(() => {
 
 const desktopColumnWidths = computed(() => {
   if (showAccountQuotaColumn.value) {
+    if (selectedProviderType.value === 'antigravity') {
+      return {
+        name: '18%',
+        quota: '15%',
+        stats: '14%',
+        imported: '9%',
+        lastUsed: '8%',
+        score: '9%',
+        status: '12%',
+        actions: '15%',
+      }
+    }
     return {
       name: '19%',
-      quota: '18%',
+      quota: '17%',
       stats: '15%',
       imported: '10%',
       lastUsed: '8%',
       score: '9%',
-      status: '7%',
+      status: '8%',
       actions: '14%',
     }
   }
@@ -1849,6 +1903,8 @@ type PoolKeyUiState = {
   modelFetchLabel: string
   modelFetchClass: string
   modelFetchTitle: string
+  modelFetchHint: string
+  antigravityInferenceRejection: AntigravityInferenceRejectionDisplay | null
   desktopActionIds: PoolMobileActionId[]
 }
 
@@ -1913,9 +1969,10 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
 
     map[key.key_id] = {
       rowClass: getRowClass(key, tick),
-      schedulingBadgeLabel: getSchedulingBadgeLabel(key, tick),
-      schedulingBadgeVariant: getSchedulingBadgeVariant(key, tick),
-      schedulingTitle: getSchedulingTitle(key, tick),
+      schedulingBadgeLabel: getSchedulingBadgeLabel(key, tick, providerType),
+      schedulingBadgeVariant: getSchedulingBadgeVariant(key, tick, providerType),
+      schedulingTitle: getSchedulingTitle(key, tick, providerType),
+      antigravityInferenceRejection: getAntigravityInferenceRejectionDisplay(key, providerType, tick),
       oauthOrgBadge,
       visibleOAuthState,
       oauthStatusTitle: visibleOAuthState ? getOAuthStatusTitle(key, tick) : '',
@@ -1949,7 +2006,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
         canRecoverHealth: true,
         hasProxy: true,
       }).primary,
-      ...getModelFetchDisplay(key),
+      ...getPoolKeyModelFetchDisplay(key, providerType),
       desktopActionIds: [
         ...(key.cooldown_reason ? ['clear_cooldown' as const] : []),
         ...(canResetCycleStats(key) ? ['reset_cycle_stats' as const] : []),
@@ -1967,30 +2024,6 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
   return map
 })
 
-function getModelFetchDisplay(key: PoolKeyDetail): Pick<PoolKeyUiState, 'modelFetchLabel' | 'modelFetchClass' | 'modelFetchTitle'> {
-  if (!key.auto_fetch_models) {
-    return { modelFetchLabel: '', modelFetchClass: '', modelFetchTitle: '' }
-  }
-  if (key.last_models_fetch_error) {
-    return {
-      modelFetchLabel: '模型同步失败',
-      modelFetchClass: 'text-amber-600 dark:text-amber-400',
-      modelFetchTitle: key.last_models_fetch_error,
-    }
-  }
-  if (key.last_models_fetch_at) {
-    return {
-      modelFetchLabel: '模型同步成功',
-      modelFetchClass: 'text-emerald-600 dark:text-emerald-400',
-      modelFetchTitle: `最近同步：${new Date(key.last_models_fetch_at * 1000).toLocaleString()}`,
-    }
-  }
-  return {
-    modelFetchLabel: '模型待同步',
-    modelFetchClass: 'text-muted-foreground',
-    modelFetchTitle: '已启用自动获取模型，尚无同步结果',
-  }
-}
 
 function getPoolKeyStatsDisplay(key: PoolKeyDetail): PoolStatsDisplay {
   return keyUiStateMap.value[key.key_id]?.statsDisplay
@@ -2109,9 +2142,19 @@ function applyPoolKeyActiveState(key: PoolKeyDetail, nextStatus: boolean): void 
   }
 }
 
-/** 把批量额度刷新结果增量写回当前页，不重载并丢失本地 UI 状态。 */
-function applyQuotaRefreshResultToCurrentPage(result: Awaited<ReturnType<typeof refreshProviderQuota>>): void {
+/** 把批量额度刷新结果增量写回当前页，并返回是否命中需重载权威调度状态的运行时额度耗尽行。 */
+function applyQuotaRefreshResultToCurrentPage(
+  result: Awaited<ReturnType<typeof refreshProviderQuota>>,
+  refreshedKeyIds?: readonly string[],
+): boolean {
+  const shouldReload = shouldReloadPoolPageAfterQuotaRefresh(
+    keyPage.value.keys,
+    result.results,
+    selectedProviderType.value,
+    result.success > 0 ? refreshedKeyIds : undefined,
+  )
   keyPage.value.keys = mergePoolKeyQuotaSnapshots(keyPage.value.keys, result.results)
+  return shouldReload
 }
 
 /**
@@ -2159,7 +2202,11 @@ async function handleRefreshPoolKeyQuota(key: PoolKeyDetail): Promise<void> {
     const result = await refreshProviderQuota(providerId, [keyId])
     // Provider 已切换时直接丢弃旧响应：既不写回新页，也不弹出过期的成功/失败提示。
     if (selectedProviderId.value !== providerId) return
-    applyQuotaRefreshResultToCurrentPage(result)
+    const shouldReloadAuthoritativePage = applyQuotaRefreshResultToCurrentPage(result, [keyId])
+    if (shouldReloadAuthoritativePage) {
+      await loadKeys({ silent: true })
+    }
+    if (selectedProviderId.value !== providerId) return
     if (result.success > 0) {
       success('额度已刷新')
       return
@@ -2254,6 +2301,9 @@ function canConsumeCodexResetCredit(key: PoolKeyDetail): boolean {
  */
 async function handleConsumeCodexResetCredit(key: PoolKeyDetail): Promise<void> {
   if (!canConsumeCodexResetCredit(key)) return
+  const providerId = selectedProviderId.value
+  const providerType = selectedProviderType.value
+  if (!providerId) return
   const generation = getCodexCredentialGeneration(key)
   if (generation === undefined) return
   const pendingIdempotencyKey = getPendingCodexResetCreditIdempotencyKey(key)
@@ -2266,7 +2316,7 @@ async function handleConsumeCodexResetCredit(key: PoolKeyDetail): Promise<void> 
     get cancelText() { return t('common.cancel') },
     variant: 'warning',
   })
-  if (!confirmed) return
+  if (!confirmed || selectedProviderId.value !== providerId) return
 
   consumingCodexResetCreditKeyId.value = key.key_id
   try {
@@ -2279,6 +2329,12 @@ async function handleConsumeCodexResetCredit(key: PoolKeyDetail): Promise<void> 
       expected_credential_generation: generation,
     })
     clearPendingCodexResetCreditIdempotencyKeyForOutcome(key.key_id, result.outcome)
+    if (selectedProviderId.value !== providerId) return
+    const isResetSuccess = result.outcome === 'reset' || result.outcome === 'already_redeemed'
+    const targetRow = keyPage.value.keys.find(item => item.key_id === result.key_id || item.key_id === key.key_id) ?? key
+    const shouldReloadAuthoritativePage = isResetSuccess
+      && result.refresh_status !== 'failed'
+      && isRuntimeQuotaExhaustedPoolKey(targetRow, providerType)
     keyPage.value.keys = mergePoolKeyQuotaSnapshots(keyPage.value.keys, [{
       key_id: result.key_id,
       key_name: key.key_name,
@@ -2286,7 +2342,11 @@ async function handleConsumeCodexResetCredit(key: PoolKeyDetail): Promise<void> 
       metadata: result.metadata,
       quota_snapshot: result.quota_snapshot,
     }])
-    if (result.outcome === 'reset' || result.outcome === 'already_redeemed') {
+    if (shouldReloadAuthoritativePage) {
+      await loadKeys({ silent: true })
+    }
+    if (selectedProviderId.value !== providerId) return
+    if (isResetSuccess) {
       success(t('ui.codexQuotaResetUsedAccountQuotaRefreshed'))
     } else {
       showWarning(result.message || t('ui.resetRequestProcessedCheckTheLatestQuota'))
@@ -2304,7 +2364,9 @@ async function handleConsumeCodexResetCredit(key: PoolKeyDetail): Promise<void> 
         generation,
       )
     }
-    showError(parseApiError(err, t('ui.failedToUseCodexQuotaReset')))
+    if (selectedProviderId.value === providerId) {
+      showError(parseApiError(err, t('ui.failedToUseCodexQuotaReset')))
+    }
   } finally {
     consumingCodexResetCreditKeyId.value = null
   }
@@ -2382,15 +2444,20 @@ async function refreshCurrentPageQuotaInBackground(
   refreshingCurrentPageQuota.value = true
   try {
     const result = await refreshProviderQuota(providerId, quotaStats.eligibleIds)
-    applyQuotaRefreshResultToCurrentPage(result)
+    if (selectedProviderId.value !== providerId) return false
+    const shouldReloadForQuotaRecovery = applyQuotaRefreshResultToCurrentPage(result, quotaStats.eligibleIds)
     const successCount = Number(result.success || 0)
     const failedCount = Number(result.failed || 0)
     const skippedCount = Math.max(quotaStats.total - quotaStats.eligibleIds.length, 0)
 
     // 刷新当前页数据，展示最新额度与状态
-    if (selectedProviderId.value === providerId && options.reloadAfter !== false) {
-      await loadKeys({ silent: options.reloadAfter === 'silent' })
+    if (
+      selectedProviderId.value === providerId
+      && (options.reloadAfter !== false || shouldReloadForQuotaRecovery)
+    ) {
+      await loadKeys({ silent: options.reloadAfter === 'silent' || options.reloadAfter === false })
     }
+    if (selectedProviderId.value !== providerId) return false
 
     if (!options.silent) {
       const skippedText = skippedCount > 0 ? `，冷却跳过 ${skippedCount}` : ''
@@ -2403,7 +2470,9 @@ async function refreshCurrentPageQuotaInBackground(
     }
     return true
   } catch (err) {
-    showError(parseApiError(err, t('ui.failedToRefreshQuotaForThisPage')))
+    if (selectedProviderId.value === providerId) {
+      showError(parseApiError(err, t('ui.failedToRefreshQuotaForThisPage')))
+    }
     return false
   } finally {
     refreshingCurrentPageQuota.value = false
@@ -2430,8 +2499,9 @@ const refreshButtonTitle = computed(() => {
 })
 
 async function refreshCurrentPage() {
+  const providerId = selectedProviderId.value
   const quotaDidReload = await refreshCurrentPageQuotaInBackground({ reloadAfter: true })
-  if (!quotaDidReload) {
+  if (!quotaDidReload && selectedProviderId.value === providerId) {
     await refresh()
   }
 }

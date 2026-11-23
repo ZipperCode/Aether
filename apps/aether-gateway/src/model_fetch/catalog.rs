@@ -203,6 +203,9 @@ impl CodexCatalogLoad {
 pub(crate) trait CodexCatalogRuntime: ModelFetchTransportRuntime + Send + Sync {
     fn codex_catalog_runtime_state(&self) -> &RuntimeState;
 
+    /// Publish through managed key discovery, never grant access from a client catalog alone.
+    fn schedule_managed_catalog_refresh(&self, _provider_id: &str, _key_id: &str) {}
+
     fn codex_catalog_fetch_pace_ttl(&self) -> Duration {
         CODEX_CATALOG_FETCH_PACE_TTL
     }
@@ -1068,6 +1071,31 @@ where
             "Codex catalog fetch result was removed because the credential scope changed during persistence"
         );
         return None;
+    }
+    // A versioned client may see a new model before the periodic scan. Only
+    // opt-in pools refresh the key; the managed fetch rechecks its own gates
+    // and reads the authoritative management-version catalog from this cache.
+    if let Some(transport) = transports.first() {
+        let incoming = outcome
+            .upstream_metadata
+            .as_ref()
+            .and_then(|v| v.get("codex_model_discovery"));
+        if incoming.is_some()
+            && aether_model_fetch::pool_auto_publish_discovered_models_enabled(
+                transport.provider.config.as_ref(),
+            )
+            && incoming
+                != transport
+                    .key
+                    .upstream_metadata
+                    .as_ref()
+                    .and_then(|v| v.get("codex_model_discovery"))
+        {
+            runtime.schedule_managed_catalog_refresh(
+                &target.identity.provider_id,
+                &target.identity.key_id,
+            );
+        }
     }
     Some(snapshot)
 }

@@ -1037,6 +1037,9 @@ async fn refresh_codex_provider_quota_locally_with_reset_fence(
                 }
             };
 
+        let quota_account_id =
+            crate::orchestration::codex_account_id_from_headers(&request_spec.headers)
+                .map(str::to_owned);
         let quota_request_fallback_started_at_unix_ms = crate::clock::current_unix_ms();
         let quota_request_fallback_order_id = uuid::Uuid::now_v7().to_string();
         let result = match execute_codex_quota_plan(
@@ -1220,6 +1223,16 @@ async fn refresh_codex_provider_quota_locally_with_reset_fence(
             }
         }
 
+        let incoming_account_windows = (status == "success"
+            && quota_window_coverage
+                != aether_admin::provider::quota::CodexQuotaWindowCoverage::Patch)
+            .then(|| {
+                metadata_update
+                    .as_ref()
+                    .and_then(|m| m.get("codex"))
+                    .cloned()
+            })
+            .flatten();
         let persisted = if let Some(expected_credential) = quota_credential_fence.as_ref() {
             persist_fenced_provider_quota_refresh_state(
                 state,
@@ -1295,6 +1308,33 @@ async fn refresh_codex_provider_quota_locally_with_reset_fence(
                     .and_then(|codex| codex.get("oauth_state_request_id"))
                     .and_then(serde_json::Value::as_str)
                     == Some(quota_request_order_id));
+        if request_owns_persisted_oauth_state {
+            if let Some(incoming) = incoming_account_windows.as_ref() {
+                crate::handlers::admin::provider::shared::quota_recovery::recover_oauth_quota_hold(
+                    state,
+                    &key,
+                    "codex",
+                    now_unix_secs,
+                    incoming,
+                )
+                .await?;
+                use crate::handlers::admin::provider::shared::quota_recovery::codex_account_windows_available;
+                if quota_credential_fence.is_some()
+                    && codex_account_windows_available(incoming)
+                    && persisted_codex_metadata
+                        .as_ref()
+                        .is_some_and(codex_account_windows_available)
+                {
+                    crate::orchestration::clear_codex_quota_breaker_after_refresh(
+                        state.app(),
+                        &key.id,
+                        quota_account_id.as_deref(),
+                        quota_request_started_at_unix_ms,
+                    )
+                    .await?;
+                }
+            }
+        }
         let credential_cas_delete = quota_credential_fence.as_ref().map(|credential_fence| {
             ProviderCatalogKeyOAuthCredentialCasDelete {
                 key_id: key.id.clone(),

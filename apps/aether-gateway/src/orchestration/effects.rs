@@ -12,6 +12,7 @@ use aether_data_contracts::repository::pool_scores::{
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyAdaptiveState, ProviderCatalogKeyAdaptiveStateUpdate,
     ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeySchedulingStateCasUpdate,
+    ProviderCatalogKeyStatusSnapshotUpdate,
 };
 use aether_routing_core::RoutingPoolPolicyOverride;
 use aether_scheduler_core::{
@@ -47,7 +48,7 @@ use crate::handlers::shared::provider_pool::{
     admin_provider_pool_key_terminal_error_reason,
     admin_provider_pool_quota_probe_active_members_key, record_admin_provider_pool_error,
     record_admin_provider_pool_stream_timeout, record_admin_provider_pool_success,
-    release_admin_provider_pool_key_lease, AdminProviderPoolConfig,
+    record_pool_forbidden_cooldown, release_admin_provider_pool_key_lease, AdminProviderPoolConfig,
     AdminProviderPoolSchedulingPreset,
 };
 use crate::orchestration::{
@@ -388,6 +389,7 @@ impl<'a> LocalStreamFailureEffect<'a> {
 }
 
 struct PoolFeedbackContext {
+    provider_type: String,
     pool_config: AdminProviderPoolConfig,
     sticky_session_token: Option<String>,
 }
@@ -1430,6 +1432,7 @@ async fn resolve_pool_feedback_context(
         .and_then(extract_pool_sticky_session_token);
 
     Some(PoolFeedbackContext {
+        provider_type: transport.provider.provider_type.clone(),
         pool_config,
         sticky_session_token,
     })
@@ -2111,7 +2114,15 @@ async fn record_pool_error_effect(
     }
     let terminal_error_reason =
         admin_provider_pool_key_terminal_error_reason(effect.status_code, effect.error_body);
-    if terminal_error_reason.is_none()
+    let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
+        return;
+    };
+    let antigravity_forbidden = effect.status_code == 403
+        && pool_context
+            .provider_type
+            .eq_ignore_ascii_case("antigravity");
+    if !antigravity_forbidden
+        && terminal_error_reason.is_none()
         && !local_candidate_failure_should_record_pool_error(
             effect.classification,
             effect.status_code,
@@ -2120,10 +2131,6 @@ async fn record_pool_error_effect(
         return;
     }
 
-    let Some(pool_context) = resolve_pool_feedback_context(state, context).await else {
-        return;
-    };
-
     clear_pool_key_circuit_breaker(state, context).await;
     if capture_local_execution_auth_config_fence(state, context.plan)
         .await
@@ -2131,29 +2138,61 @@ async fn record_pool_error_effect(
     {
         return;
     }
-    record_admin_provider_pool_error(
-        state.runtime_state.as_ref(),
-        &context.plan.provider_id,
-        &context.plan.key_id,
-        &pool_context.pool_config,
-        effect.status_code,
-        effect.error_body,
-        Some(effect.headers),
-    )
-    .await;
+    let feedback = serde_json::json!({
+        "last_request_feedback": {
+            "source": "pool_error",
+            "status_code": effect.status_code,
+            "classification": format!("{:?}", effect.classification)
+        }
+    });
+    let hard_state = if antigravity_forbidden
+        && resolve_local_oauth_invalid_reason(
+            &pool_context.provider_type,
+            effect.status_code,
+            effect.error_body,
+        )
+        .is_none()
+    {
+        // Project/model access denied is not a credential failure. Keep the last
+        // denial separate from mutable score feedback so a later probe cannot hide it.
+        let observed_at = current_unix_secs();
+        let retry_at = record_pool_forbidden_cooldown(
+            state.runtime_state.as_ref(),
+            &context.plan.provider_id,
+            &context.plan.key_id,
+            &pool_context.pool_config,
+        )
+        .await;
+        if let Err(error) = state.update_provider_catalog_key_status_snapshot(&ProviderCatalogKeyStatusSnapshotUpdate {
+            key_id: context.plan.key_id.clone(),
+            status_snapshot_patch: serde_json::json!({"last_inference_rejection": {"observed_at": observed_at, "retry_at": retry_at}}),
+            updated_at_unix_secs: Some(observed_at),
+        }).await {
+            warn!(key_id = %context.plan.key_id, ?error, "could not persist Antigravity inference rejection history");
+        }
+        tracing::info!(provider_id = %context.plan.provider_id, key_id = %context.plan.key_id, retry_at,
+            "Antigravity inference denied; account eligible to retry after cooldown");
+        Some(PoolMemberHardState::Cooldown)
+    } else {
+        record_admin_provider_pool_error(
+            state.runtime_state.as_ref(),
+            &context.plan.provider_id,
+            &context.plan.key_id,
+            &pool_context.pool_config,
+            effect.status_code,
+            effect.error_body,
+            Some(effect.headers),
+        )
+        .await;
+        pool_score_hard_state_for_status(effect.status_code, effect.error_body)
+    };
     record_pool_score_schedule_feedback(
         state,
         context,
         Some(false),
-        pool_score_hard_state_for_status(effect.status_code, effect.error_body),
+        hard_state,
         Some(pool_score_delta_for_status(effect.status_code)),
-        serde_json::json!({
-            "last_request_feedback": {
-                "source": "pool_error",
-                "status_code": effect.status_code,
-                "classification": format!("{:?}", effect.classification)
-            }
-        }),
+        feedback,
     )
     .await;
 }

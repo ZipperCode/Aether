@@ -622,6 +622,7 @@ import {
 import {
   getGenericQuotaTypeLabel as getQuotaTypeLabel,
   getGenericQuotaStatusTitle,
+  getQuotaExhaustedSchedulingLabel,
   getQuotaQueryStatusLabel,
 } from '@/features/providers/utils/providerKeyQuota'
 import { detectOfficialProviderFromEndpoints } from '@/features/providers/utils/officialEndpointDetection'
@@ -1493,7 +1494,9 @@ function getGenericQuotaTypeLabel(key: EndpointAPIKey): string | null {
 }
 
 function getGenericQuotaStatusLabel(key: EndpointAPIKey): string | null {
-  if (isQuotaSchedulingBlocked(key)) return '额度耗尽·需人工恢复'
+  if (isQuotaSchedulingBlocked(key)) {
+    return getQuotaExhaustedSchedulingLabel(getGenericQuotaProviderType(key), key.is_active)
+  }
   if (isQuotaSchedulingSuspected(key)) return '疑似额度不足'
   return getQuotaQueryStatusLabel(
     key.status_snapshot?.quota,
@@ -1516,6 +1519,7 @@ function getGenericQuotaTooltip(key: EndpointAPIKey): string {
     quota: key.status_snapshot?.quota,
     scheduling: key.status_snapshot?.scheduling,
     providerType: getGenericQuotaProviderType(key),
+    isActive: key.is_active,
     locale: locale.value,
   })
 }

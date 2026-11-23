@@ -267,10 +267,34 @@ async fn list_codex_model_rows(
             state.list_minimal_candidate_selection_rows_for_api_format(query_format),
         )
         .await?;
-        let mut filtered = filter_eligible_model_rows(rows, auth_snapshot, query_format);
-        collected.append(&mut filtered);
+        let mut catalog_rows = Vec::new();
+        for row in rows.into_iter().filter(is_codex_provider_row) {
+            if !row.routing_facts.provider_pool_enabled {
+                catalog_rows.push(row);
+                continue;
+            }
+            // The scheduling query returns a representative, not the account catalog.
+            // Filter each actual member below so its entitlements are not inherited.
+            let query = aether_data_contracts::repository::candidate_selection::StoredPoolKeyCandidateRowsQuery {
+                api_format: query_format.to_string(), provider_id: row.provider_id,
+                endpoint_id: row.endpoint_id, model_id: row.model_id,
+                selected_provider_model_name: row.model_provider_model_name,
+                order: Default::default(), offset: 0, limit: u32::MAX,
+            };
+            catalog_rows.extend(
+                await_models_route_read(
+                    "codex_catalog_pool_members",
+                    state.list_pool_key_candidate_rows_for_group(&query),
+                )
+                .await?,
+            );
+        }
+        collected.extend(filter_eligible_model_rows(
+            catalog_rows,
+            auth_snapshot,
+            query_format,
+        ));
     }
-    collected.retain(is_codex_provider_row);
     let codex_catalog_targets = crate::model_fetch::codex_catalog_targets(&collected);
     Some(ModelRowsForClientFormat {
         rows: sort_model_rows(collected),

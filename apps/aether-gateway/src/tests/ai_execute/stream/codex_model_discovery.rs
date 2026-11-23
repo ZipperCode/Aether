@@ -17,14 +17,16 @@ use aether_data::repository::{
 };
 use aether_data_contracts::repository::{
     candidate_selection::{
-        StoredMinimalCandidateRoutingFacts, StoredMinimalCandidateSelectionRow,
-        StoredProviderModelMapping,
+        MinimalCandidateSelectionReadRepository, StoredMinimalCandidateRoutingFacts,
+        StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateRowsByKeyIdsQuery,
+        StoredPoolKeyCandidateRowsQuery, StoredProviderModelMapping,
+        StoredRequestedModelCandidateRowsQuery,
     },
     candidates::{RequestCandidateReadRepository, RequestCandidateStatus},
     global_models::{StoredAdminGlobalModel, StoredAdminProviderModel, StoredModelEndpointBinding},
     provider_catalog::{
-        ProviderCatalogReadRepository, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-        StoredProviderCatalogProvider,
+        ProviderCatalogReadRepository, ProviderCatalogWriteRepository,
+        StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     },
     routing_profiles::{CreateRoutingGroupRecord, RoutingGroupWriteRepository},
 };
@@ -34,8 +36,9 @@ use axum::extract::{Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_ENCODING};
 use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{any, get};
 use axum::{Json, Router};
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -682,6 +685,8 @@ struct AccountSeedSpec {
     key_name: String,
     oauth_token: &'static str,
     account_id: &'static str,
+    account_user_id: Option<&'static str>,
+    expires_at_unix_secs: Option<u64>,
     internal_priority: i32,
     auto_fetch_models: bool,
     allowed_models: Option<Vec<String>>,
@@ -696,6 +701,8 @@ impl AccountSeedSpec {
             key_name: "free".to_string(),
             oauth_token: FREE_OAUTH_TOKEN,
             account_id: FREE_ACCOUNT_ID,
+            account_user_id: None,
+            expires_at_unix_secs: None,
             internal_priority: 0,
             auto_fetch_models: true,
             allowed_models: None,
@@ -710,6 +717,8 @@ impl AccountSeedSpec {
             key_name: "paid".to_string(),
             oauth_token: PAID_OAUTH_TOKEN,
             account_id: PAID_ACCOUNT_ID,
+            account_user_id: None,
+            expires_at_unix_secs: None,
             internal_priority: 1,
             auto_fetch_models: true,
             allowed_models: None,
@@ -724,6 +733,7 @@ struct FixtureBuilder {
     pool_enabled: bool,
     sticky_cache_affinity: bool,
     responses_websocket_enabled: bool,
+    auto_publish_discovered_models: bool,
     include_alias_model: bool,
     client_api_key: String,
     endpoint_body_rules: Option<Value>,
@@ -733,6 +743,10 @@ struct FixtureBuilder {
     paid_catalog: UpstreamCatalogReply,
     free_supported_models: Vec<String>,
     paid_supported_models: Vec<String>,
+    seed_paid_account: bool,
+    oauth_token_url: Option<String>,
+    oauth_state_entries: Vec<(String, Value)>,
+    execution_runtime_url: Option<String>,
 }
 
 impl FixtureBuilder {
@@ -742,6 +756,7 @@ impl FixtureBuilder {
             pool_enabled: true,
             sticky_cache_affinity: false,
             responses_websocket_enabled: false,
+            auto_publish_discovered_models: false,
             include_alias_model: false,
             client_api_key: DEFAULT_CLIENT_API_KEY.to_string(),
             endpoint_body_rules: None,
@@ -754,13 +769,17 @@ impl FixtureBuilder {
             ),
             free_supported_models: vec![BASIC_MODEL.to_string()],
             paid_supported_models: vec![BASIC_MODEL.to_string(), ADVANCED_MODEL.to_string()],
+            seed_paid_account: true,
+            oauth_token_url: None,
+            oauth_state_entries: Vec::new(),
+            execution_runtime_url: None,
         }
     }
 
     fn build_provider_config(&self) -> Option<Value> {
         let mut root = serde_json::Map::new();
         if self.pool_enabled {
-            let pool_advanced = if self.sticky_cache_affinity {
+            let mut pool_advanced = if self.sticky_cache_affinity {
                 json!({
                     "sticky_session_ttl_seconds": 3600,
                     "scheduling_presets": [
@@ -774,6 +793,12 @@ impl FixtureBuilder {
                     ]
                 })
             };
+            if self.auto_publish_discovered_models {
+                pool_advanced
+                    .as_object_mut()
+                    .expect("pool_advanced should be object")
+                    .insert("auto_publish_discovered_models".to_string(), json!(true));
+            }
             root.insert("pool_advanced".to_string(), pool_advanced);
         }
         if self.responses_websocket_enabled {
@@ -888,24 +913,11 @@ impl FixtureBuilder {
             ));
         }
 
-        let mut selection_rows = Vec::new();
         let mut admin_global_models = Vec::new();
         let mut admin_provider_models = Vec::new();
         let mut endpoint_bindings = Vec::new();
 
         for (model_id, global_model_id, global_name, provider_model_name) in &model_specs {
-            for account in [&self.free_account, &self.paid_account] {
-                selection_rows.push(build_codex_selection_row(
-                    &provider_id,
-                    &endpoint_id,
-                    model_id,
-                    global_model_id,
-                    global_name,
-                    provider_model_name,
-                    account,
-                    self.pool_enabled,
-                ));
-            }
             admin_global_models.push(
                 StoredAdminGlobalModel::new(
                     global_model_id.clone(),
@@ -965,10 +977,15 @@ impl FixtureBuilder {
             );
         }
 
+        let seeded_keys = if self.seed_paid_account {
+            vec![free_key, paid_key]
+        } else {
+            vec![free_key]
+        };
         let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
             vec![provider],
             vec![endpoint],
-            vec![free_key, paid_key],
+            seeded_keys,
         ));
         let global_model_repository = Arc::new(
             InMemoryGlobalModelReadRepository::seed(Vec::new())
@@ -1039,11 +1056,28 @@ impl FixtureBuilder {
             .await
             .expect("routing group should create");
 
-        let gateway_state = bootstrap
+        let candidate_selection_repository = Arc::new(DynamicCodexCandidateSelectionRepository {
+            provider_id: provider_id.clone(),
+            endpoint_id: endpoint_id.clone(),
+            pool_enabled: self.pool_enabled,
+            model_specs: model_specs
+                .iter()
+                .map(|(model_id, global_model_id, global_name, provider_model_name)| {
+                    (
+                        model_id.clone(),
+                        global_model_id.clone(),
+                        (*global_name).to_string(),
+                        (*provider_model_name).to_string(),
+                    )
+                })
+                .collect(),
+            provider_catalog_repository: Arc::clone(&provider_catalog_repository),
+        });
+        let mut gateway_state = bootstrap
             .with_data_state_for_tests(
                 crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_request_candidates_and_usage_for_tests(
                     auth_repository,
-                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(selection_rows)),
+                    candidate_selection_repository,
                     Arc::clone(&provider_catalog_repository),
                     Arc::clone(&candidate_repository),
                     Arc::new(InMemoryUsageReadRepository::default()),
@@ -1057,6 +1091,16 @@ impl FixtureBuilder {
                 enabled: true,
                 ..Default::default()
             });
+        if let Some(token_url) = self.oauth_token_url {
+            gateway_state = gateway_state.with_provider_oauth_token_url_for_tests("codex", token_url);
+        }
+        for (nonce, payload) in self.oauth_state_entries {
+            gateway_state = gateway_state.with_provider_oauth_state_entry_for_tests(&nonce, payload);
+        }
+        if let Some(execution_runtime_url) = self.execution_runtime_url {
+            gateway_state =
+                gateway_state.with_execution_runtime_override_base_url(execution_runtime_url);
+        }
 
         let (gateway_url, gateway_server) =
             start_server(build_router_with_state(gateway_state.clone())).await;
@@ -1088,13 +1132,16 @@ fn build_codex_oauth_catalog_key(
     provider_id: &str,
     spec: &AccountSeedSpec,
 ) -> StoredProviderCatalogKey {
-    let auth_config_json = json!({
+    let mut auth_config = json!({
         "provider_type": "codex",
         "account_id": spec.account_id,
         "access_token": spec.oauth_token,
-        "expires_at": 4_102_444_800_u64
-    })
-    .to_string();
+        "expires_at": spec.expires_at_unix_secs.unwrap_or(4_102_444_800_u64)
+    });
+    if let Some(account_user_id) = spec.account_user_id {
+        auth_config["account_user_id"] = json!(account_user_id);
+    }
+    let auth_config_json = auth_config.to_string();
     let mut key = StoredProviderCatalogKey::new(
         spec.key_id.clone(),
         provider_id.to_string(),
@@ -1126,6 +1173,7 @@ fn build_codex_oauth_catalog_key(
     key.auto_fetch_models = spec.auto_fetch_models;
     key.locked_models = spec.locked_models.as_ref().map(|models| json!(models));
     key.upstream_metadata = spec.upstream_metadata.clone();
+    key.expires_at_unix_secs = spec.expires_at_unix_secs;
     key
 }
 
@@ -1184,6 +1232,132 @@ fn build_codex_selection_row(
         model_supports_streaming: Some(true),
         model_is_active: true,
         model_is_available: true,
+    }
+}
+
+struct DynamicCodexCandidateSelectionRepository {
+    provider_id: String,
+    endpoint_id: String,
+    pool_enabled: bool,
+    model_specs: Vec<(String, String, String, String)>,
+    provider_catalog_repository: Arc<InMemoryProviderCatalogReadRepository>,
+}
+
+impl DynamicCodexCandidateSelectionRepository {
+    async fn snapshot_repo(&self) -> InMemoryMinimalCandidateSelectionReadRepository {
+        let keys = self
+            .provider_catalog_repository
+            .list_keys_by_provider_ids(std::slice::from_ref(&self.provider_id))
+            .await
+            .expect("in-memory provider catalog keys should list");
+        let mut rows = Vec::new();
+        for (model_id, global_model_id, global_name, provider_model_name) in &self.model_specs {
+            for key in &keys {
+                let allowed_models = key
+                    .allowed_models
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    });
+                let account = AccountSeedSpec {
+                    key_id: key.id.clone(),
+                    key_name: key.name.clone(),
+                    oauth_token: "",
+                    account_id: "",
+                    account_user_id: None,
+                    expires_at_unix_secs: key.expires_at_unix_secs,
+                    internal_priority: key.internal_priority,
+                    auto_fetch_models: key.auto_fetch_models,
+                    allowed_models,
+                    locked_models: None,
+                    upstream_metadata: key.upstream_metadata.clone(),
+                };
+                let mut row = build_codex_selection_row(
+                    &self.provider_id,
+                    &self.endpoint_id,
+                    model_id,
+                    global_model_id,
+                    global_name,
+                    provider_model_name,
+                    &account,
+                    self.pool_enabled,
+                );
+                row.key_is_active = key.is_active;
+                row.key_auth_type = key.auth_type.clone();
+                rows.push(row);
+            }
+        }
+        InMemoryMinimalCandidateSelectionReadRepository::seed(rows)
+    }
+}
+
+#[async_trait::async_trait]
+impl MinimalCandidateSelectionReadRepository for DynamicCodexCandidateSelectionRepository {
+    async fn list_for_exact_api_format(
+        &self,
+        api_format: &str,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, aether_data::DataLayerError> {
+        self.snapshot_repo()
+            .await
+            .list_for_exact_api_format(api_format)
+            .await
+    }
+
+    async fn list_for_exact_api_format_and_global_model(
+        &self,
+        api_format: &str,
+        global_model_name: &str,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, aether_data::DataLayerError> {
+        self.snapshot_repo()
+            .await
+            .list_for_exact_api_format_and_global_model(api_format, global_model_name)
+            .await
+    }
+
+    async fn list_for_exact_api_format_and_requested_model(
+        &self,
+        api_format: &str,
+        requested_model_name: &str,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, aether_data::DataLayerError> {
+        self.snapshot_repo()
+            .await
+            .list_for_exact_api_format_and_requested_model(api_format, requested_model_name)
+            .await
+    }
+
+    async fn list_for_exact_api_format_and_requested_model_page(
+        &self,
+        query: &StoredRequestedModelCandidateRowsQuery,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, aether_data::DataLayerError> {
+        self.snapshot_repo()
+            .await
+            .list_for_exact_api_format_and_requested_model_page(query)
+            .await
+    }
+
+    async fn list_pool_key_rows_for_group(
+        &self,
+        query: &StoredPoolKeyCandidateRowsQuery,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, aether_data::DataLayerError> {
+        self.snapshot_repo()
+            .await
+            .list_pool_key_rows_for_group(query)
+            .await
+    }
+
+    async fn list_pool_key_rows_for_group_key_ids(
+        &self,
+        query: &StoredPoolKeyCandidateRowsByKeyIdsQuery,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, aether_data::DataLayerError> {
+        self.snapshot_repo()
+            .await
+            .list_pool_key_rows_for_group_key_ids(query)
+            .await
     }
 }
 
@@ -2387,4 +2561,823 @@ async fn codex_model_discovery_versioned_models_bootstrap_succeeds_without_writi
         0,
         "public versioned /v1/models display must not authorize text generation without per-key discovery"
     );
+}
+
+#[test]
+fn codex_model_discovery_versioned_models_opt_in_pool_schedules_managed_fetch_and_serves() {
+    run_async_test_on_large_stack(
+        "codex_model_discovery_versioned_models_opt_in_pool_schedules_managed_fetch_and_serves",
+        codex_model_discovery_versioned_models_opt_in_pool_schedules_managed_fetch_and_serves_impl(),
+    );
+}
+
+async fn codex_model_discovery_versioned_models_opt_in_pool_schedules_managed_fetch_and_serves_impl(
+) {
+    let mut builder = FixtureBuilder::new("versioned-optin-pool");
+    builder.pool_enabled = true;
+    builder.auto_publish_discovered_models = true;
+    builder.free_account.internal_priority = 0;
+    builder.paid_account.internal_priority = 1;
+    builder.free_account.upstream_metadata = Some(json!({
+        DISCOVERY_NAMESPACE: {
+            "model_ids": [BASIC_MODEL]
+        }
+    }));
+    let harness = builder.build().await;
+
+    let response = harness
+        .client
+        .get(format!(
+            "{}/v1/models?client_version=0.159.3",
+            harness.gateway_url
+        ))
+        .bearer_auth(&harness.client_api_key)
+        .send()
+        .await
+        .expect("versioned /v1/models request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let catalog_payload: Value = response
+        .json()
+        .await
+        .expect("versioned /v1/models JSON should parse");
+    let slugs: Vec<&str> = catalog_payload["models"]
+        .as_array()
+        .expect("models array should exist")
+        .iter()
+        .filter_map(|card| card.get("slug").and_then(Value::as_str))
+        .collect();
+    assert!(slugs.contains(&BASIC_MODEL), "slugs={slugs:?}");
+    assert!(slugs.contains(&ADVANCED_MODEL), "slugs={slugs:?}");
+
+    let stored_paid =
+        wait_for_key_model_fetch_completion(&harness, &harness.paid_key_id, Duration::from_secs(2))
+            .await;
+    assert_eq!(
+        stored_paid
+            .upstream_metadata
+            .as_ref()
+            .and_then(|meta| meta.get(DISCOVERY_NAMESPACE)),
+        Some(&json!({ "model_ids": [BASIC_MODEL, ADVANCED_MODEL] }))
+    );
+
+    let (adv_status, adv_body, _) = harness
+        .post_responses(
+            "trace-codex-optin-pool-advanced",
+            &json!({
+                "model": ADVANCED_MODEL,
+                "input": "Reply OK",
+                "stream": true
+            }),
+        )
+        .await;
+    assert_eq!(adv_status, StatusCode::OK, "{adv_body}");
+    let counts_after_adv = harness.counts();
+    assert_eq!(counts_after_adv.paid_gen, 1);
+    assert_eq!(counts_after_adv.free_gen, 0);
+
+    let mut deactivated_paid = stored_paid;
+    deactivated_paid.is_active = false;
+    harness
+        .provider_catalog_repository
+        .update_key(&deactivated_paid)
+        .await
+        .expect("paid key should deactivate");
+    let (basic_status, basic_body, _) = harness
+        .post_responses(
+            "trace-codex-optin-pool-basic",
+            &json!({
+                "model": BASIC_MODEL,
+                "input": "Reply OK",
+                "stream": true
+            }),
+        )
+        .await;
+    assert_eq!(basic_status, StatusCode::OK, "{basic_body}");
+    let counts_after_basic = harness.counts();
+    assert_eq!(counts_after_basic.free_gen, 1);
+    assert_eq!(counts_after_basic.paid_gen, 1);
+}
+
+async fn start_codex_oauth_token_server(
+    access_token: &'static str,
+    refresh_token: &'static str,
+    account_id: &'static str,
+    email: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let router = Router::new().route(
+        "/oauth/token",
+        any(move || async move {
+            Json(json!({
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "openid email profile offline_access",
+                "email": email,
+                "account_id": account_id,
+                "account_user_id": format!("user-{account_id}"),
+                "plan_type": "plus",
+            }))
+        }),
+    );
+    start_server(router).await
+}
+
+async fn start_slow_quota_execution_runtime_server(
+    delay: Duration,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = Arc::clone(&hits);
+    let forward_client = reqwest::Client::new();
+    let forward_client_stream = forward_client.clone();
+    let router = Router::new()
+        .route(
+            "/v1/execute/sync",
+        any(move |request: Request| {
+            let hits_inner = Arc::clone(&hits_clone);
+            let client = forward_client.clone();
+            async move {
+                let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                    &to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .expect("execution plan body should read"),
+                )
+                .expect("execution plan should parse");
+                let is_quota_url = matches!(
+                    plan.url.as_str(),
+                    "https://chatgpt.com/backend-api/wham/usage"
+                        | "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+                );
+                if is_quota_url {
+                    hits_inner.fetch_add(1, Ordering::SeqCst);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let body_json = match plan.url.as_str() {
+                        "https://chatgpt.com/backend-api/wham/usage" => json!({
+                            "plan_type": "plus",
+                            "rate_limit": {
+                                "primary_window": {
+                                    "used_percent": 12.0,
+                                    "reset_at": 1_900_000_000u64,
+                                    "window_minutes": 300
+                                }
+                            }
+                        }),
+                        _ => json!({"available_count": 0, "credits": []}),
+                    };
+                    return Json(aether_contracts::ExecutionResult {
+                        request_id: plan.request_id,
+                        candidate_id: None,
+                        status_code: 200,
+                        headers: std::collections::BTreeMap::new(),
+                        response_observation: None,
+                        body: Some(aether_contracts::ResponseBody {
+                            json_body: Some(body_json),
+                            body_bytes_b64: None,
+                        }),
+                        telemetry: None,
+                        error: None,
+                    });
+                }
+
+                let method = reqwest::Method::from_bytes(plan.method.as_bytes())
+                    .expect("execution plan method should parse");
+                let mut req = client.request(method, &plan.url);
+                for (name, value) in &plan.headers {
+                    req = req.header(name, value);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .expect("forwarded execution plan request should succeed");
+                let status_code = resp.status().as_u16();
+                let mut headers = std::collections::BTreeMap::new();
+                for (name, value) in resp.headers() {
+                    if let Ok(text) = value.to_str() {
+                        headers.insert(name.as_str().to_string(), text.to_string());
+                    }
+                }
+                let bytes = resp.bytes().await.expect("forwarded response body should read");
+                let json_body = serde_json::from_slice::<Value>(&bytes).ok();
+                let body_bytes_b64 = if json_body.is_none() && !bytes.is_empty() {
+                    Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
+                } else {
+                    None
+                };
+                Json(aether_contracts::ExecutionResult {
+                    request_id: plan.request_id,
+                    candidate_id: None,
+                    status_code,
+                    headers,
+                    response_observation: None,
+                    body: Some(aether_contracts::ResponseBody {
+                        json_body,
+                        body_bytes_b64,
+                    }),
+                    telemetry: None,
+                    error: None,
+                })
+            }
+        }),
+        )
+        .route(
+            "/v1/execute/stream",
+            any(move |request: Request| {
+                let client = forward_client_stream.clone();
+                async move {
+                    let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                        &to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .expect("stream execution plan body should read"),
+                    )
+                    .expect("stream execution plan should parse");
+                    let method = reqwest::Method::from_bytes(plan.method.as_bytes())
+                        .expect("stream execution plan method should parse");
+                    let mut req = client.request(method, &plan.url);
+                    for (name, value) in &plan.headers {
+                        req = req.header(name, value);
+                    }
+                    if let Some(json_body) = plan.body.json_body {
+                        req = req.json(&json_body);
+                    } else if let Some(b64) = plan.body.body_bytes_b64 {
+                        let raw = base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .expect("stream body_bytes_b64 should decode");
+                        req = req.body(raw);
+                    }
+                    let resp = req
+                        .send()
+                        .await
+                        .expect("forwarded stream execution plan request should succeed");
+                    let status_code = resp.status().as_u16();
+                    let mut headers = std::collections::BTreeMap::new();
+                    for (name, value) in resp.headers() {
+                        if let Ok(text) = value.to_str() {
+                            headers.insert(name.as_str().to_string(), text.to_string());
+                        }
+                    }
+                    let bytes = resp
+                        .bytes()
+                        .await
+                        .expect("forwarded stream response body should read");
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    let ndjson = format!(
+                        "{}\n{}\n{}\n",
+                        json!({
+                            "type": "headers",
+                            "payload": {
+                                "kind": "headers",
+                                "status_code": status_code,
+                                "headers": headers,
+                            }
+                        }),
+                        json!({
+                            "type": "data",
+                            "payload": {
+                                "kind": "data",
+                                "text": text,
+                            }
+                        }),
+                        json!({
+                            "type": "eof",
+                            "payload": {
+                                "kind": "eof",
+                            }
+                        }),
+                    );
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+                        .body(Body::from(ndjson))
+                        .expect("stream ndjson response should build")
+                }
+            }),
+        );
+    let (url, handle) = start_server(router).await;
+    (url, hits, handle)
+}
+
+async fn wait_for_key_model_fetch_completion(
+    harness: &CodexDiscoveryHarness,
+    key_id: &str,
+    timeout: Duration,
+) -> StoredProviderCatalogKey {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let key = harness.load_stored_key(key_id).await;
+        if key.last_models_fetch_at_unix_secs.is_some() {
+            return key;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for post-create model fetch on key {key_id}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn admin_list_provider_keys(harness: &CodexDiscoveryHarness) -> Vec<Value> {
+    let response = harness
+        .client
+        .get(format!(
+            "{}/api/admin/endpoints/providers/{}/keys?page=1&page_size=100",
+            harness.gateway_url, harness.provider_id
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-codex-discovery")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-codex-discovery")
+        .send()
+        .await
+        .expect("admin list provider keys request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value = response
+        .json()
+        .await
+        .expect("admin list provider keys JSON should parse");
+    payload["keys"]
+        .as_array()
+        .expect("keys array should exist")
+        .clone()
+}
+
+async fn assert_new_codex_account_serves_advanced_without_restart(
+    harness: &CodexDiscoveryHarness,
+    new_key_id: &str,
+    trace_id: &str,
+) {
+    let persisted =
+        wait_for_key_model_fetch_completion(harness, new_key_id, Duration::from_secs(2)).await;
+    assert!(
+        persisted.auto_fetch_models,
+        "new Codex OAuth key must default auto_fetch_models=true"
+    );
+    assert!(
+        persisted.last_models_fetch_error.is_none(),
+        "unexpected model fetch error: {:?}",
+        persisted.last_models_fetch_error
+    );
+    assert_eq!(
+        persisted
+            .upstream_metadata
+            .as_ref()
+            .and_then(|meta| meta.get(DISCOVERY_NAMESPACE)),
+        Some(&json!({ "model_ids": [BASIC_MODEL, ADVANCED_MODEL] }))
+    );
+    assert!(
+        harness.counts().paid_catalog >= 1,
+        "post-create flow must hit upstream /backend-api/codex/models"
+    );
+
+    let admin_keys = admin_list_provider_keys(harness).await;
+    let admin_key = admin_keys
+        .iter()
+        .find(|item| item["id"].as_str() == Some(new_key_id))
+        .expect("new key should appear in admin keys read endpoint");
+    assert_eq!(admin_key["auto_fetch_models"], true);
+    assert!(admin_key["last_models_fetch_at"].is_string());
+    assert!(admin_key["last_models_fetch_error"].is_null());
+    assert_eq!(
+        admin_key["upstream_metadata"][DISCOVERY_NAMESPACE]["model_ids"],
+        json!([BASIC_MODEL, ADVANCED_MODEL])
+    );
+
+    let (status, body, _) = harness
+        .post_responses(
+            trace_id,
+            &json!({
+                "model": ADVANCED_MODEL,
+                "input": "Reply OK",
+                "stream": true
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(harness.counts().paid_gen, 1);
+    assert_eq!(harness.counts().free_gen, 0);
+}
+
+#[test]
+fn codex_model_discovery_web_oauth_new_account_auto_fetches_and_serves_without_restart() {
+    run_async_test_on_large_stack(
+        "codex_model_discovery_web_oauth_new_account_auto_fetches_and_serves_without_restart",
+        codex_model_discovery_web_oauth_new_account_auto_fetches_and_serves_without_restart_impl(),
+    );
+}
+
+async fn codex_model_discovery_web_oauth_new_account_auto_fetches_and_serves_without_restart_impl() {
+    let (token_url, token_handle) = start_codex_oauth_token_server(
+        PAID_OAUTH_TOKEN,
+        "paid-web-refresh-token",
+        PAID_ACCOUNT_ID,
+        "paid-web@example.com",
+    )
+    .await;
+    let (exec_url, quota_hits, exec_handle) =
+        start_slow_quota_execution_runtime_server(Duration::from_millis(1500)).await;
+    let nonce = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let now_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_secs();
+
+    let mut builder = FixtureBuilder::new("oauth-web-create");
+    builder.seed_paid_account = false;
+    builder.oauth_token_url = Some(format!("{token_url}/oauth/token"));
+    builder.execution_runtime_url = Some(exec_url);
+    builder.oauth_state_entries.push((
+        nonce.to_string(),
+        json!({
+            "nonce": nonce,
+            "key_id": "",
+            "provider_id": "provider-codex-discovery-oauth-web-create",
+            "provider_type": "codex",
+            "pkce_verifier": "verifier-codex-web-create",
+            "initiated_by_user_id": "admin-codex-discovery",
+            "initiated_by_session_id": "session-codex-discovery",
+            "created_at": now_unix_secs,
+        }),
+    ));
+    let harness = builder.build().await;
+    let free_summary = harness.fetch_key_models(&harness.free_key_id).await;
+    assert_eq!(free_summary.succeeded, 1);
+
+    let (before_status, before_body, _) = harness
+        .post_responses(
+            "trace-web-create-before",
+            &json!({
+                "model": ADVANCED_MODEL,
+                "input": "Reply OK",
+                "stream": true
+            }),
+        )
+        .await;
+    assert_eq!(before_status, StatusCode::SERVICE_UNAVAILABLE, "{before_body}");
+    assert_eq!(harness.counts().total_gen, 0);
+
+    let response = harness
+        .client
+        .post(format!(
+            "{}/api/admin/provider-oauth/providers/{}/complete",
+            harness.gateway_url, harness.provider_id
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-codex-discovery")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-codex-discovery")
+        .json(&json!({
+            "callback_url": format!("http://localhost:1455/auth/callback?code=web-code-123&state={nonce}"),
+        }))
+        .send()
+        .await
+        .expect("oauth complete request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value = response.json().await.expect("complete JSON should parse");
+    assert_eq!(payload["replaced"], false, "payload={payload}");
+    let new_key_id = payload["key_id"]
+        .as_str()
+        .expect("key_id should exist")
+        .to_string();
+
+    // Model fetch completes and serves immediately without waiting for the 1.5s quota refresh.
+    assert_new_codex_account_serves_advanced_without_restart(
+        &harness,
+        &new_key_id,
+        "trace-web-create-after",
+    )
+    .await;
+
+    // Wait for the slow quota refresh to finish and verify it does not clobber discovery metadata.
+    let quota_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let key = harness.load_stored_key(&new_key_id).await;
+        if key
+            .upstream_metadata
+            .as_ref()
+            .and_then(|meta| meta.get("codex"))
+            .is_some()
+        {
+            assert_eq!(
+                key.upstream_metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get(DISCOVERY_NAMESPACE)),
+                Some(&json!({ "model_ids": [BASIC_MODEL, ADVANCED_MODEL] }))
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < quota_deadline,
+            "quota refresh should also complete without being blocked"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(quota_hits.load(Ordering::SeqCst) >= 1);
+
+    token_handle.abort();
+    exec_handle.abort();
+}
+
+#[test]
+fn codex_model_discovery_single_import_new_account_auto_fetches_and_serves_without_restart() {
+    run_async_test_on_large_stack(
+        "codex_model_discovery_single_import_new_account_auto_fetches_and_serves_without_restart",
+        codex_model_discovery_single_import_new_account_auto_fetches_and_serves_without_restart_impl(),
+    );
+}
+
+async fn codex_model_discovery_single_import_new_account_auto_fetches_and_serves_without_restart_impl(
+) {
+    let (token_url, token_handle) = start_codex_oauth_token_server(
+        PAID_OAUTH_TOKEN,
+        "paid-single-refresh-token",
+        PAID_ACCOUNT_ID,
+        "paid-single@example.com",
+    )
+    .await;
+    let mut builder = FixtureBuilder::new("oauth-single-import");
+    builder.seed_paid_account = false;
+    builder.oauth_token_url = Some(format!("{token_url}/oauth/token"));
+    let harness = builder.build().await;
+    let free_summary = harness.fetch_key_models(&harness.free_key_id).await;
+    assert_eq!(free_summary.succeeded, 1);
+
+    let response = harness
+        .client
+        .post(format!(
+            "{}/api/admin/provider-oauth/providers/{}/import-refresh-token",
+            harness.gateway_url, harness.provider_id
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-codex-discovery")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-codex-discovery")
+        .json(&json!({
+            "refresh_token": "paid-single-import-refresh",
+        }))
+        .send()
+        .await
+        .expect("single import request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value = response.json().await.expect("single import JSON should parse");
+    assert_eq!(payload["replaced"], false, "payload={payload}");
+    let new_key_id = payload["key_id"]
+        .as_str()
+        .expect("key_id should exist")
+        .to_string();
+
+    assert_new_codex_account_serves_advanced_without_restart(
+        &harness,
+        &new_key_id,
+        "trace-single-import-after",
+    )
+    .await;
+
+    token_handle.abort();
+}
+
+#[test]
+fn codex_model_discovery_batch_import_new_account_auto_fetches_and_serves_without_restart() {
+    run_async_test_on_large_stack(
+        "codex_model_discovery_batch_import_new_account_auto_fetches_and_serves_without_restart",
+        codex_model_discovery_batch_import_new_account_auto_fetches_and_serves_without_restart_impl(),
+    );
+}
+
+async fn codex_model_discovery_batch_import_new_account_auto_fetches_and_serves_without_restart_impl(
+) {
+    let (token_url, token_handle) = start_codex_oauth_token_server(
+        PAID_OAUTH_TOKEN,
+        "paid-batch-refresh-token",
+        PAID_ACCOUNT_ID,
+        "paid-batch@example.com",
+    )
+    .await;
+    let mut builder = FixtureBuilder::new("oauth-batch-import");
+    builder.seed_paid_account = false;
+    builder.oauth_token_url = Some(format!("{token_url}/oauth/token"));
+    let harness = builder.build().await;
+    let free_summary = harness.fetch_key_models(&harness.free_key_id).await;
+    assert_eq!(free_summary.succeeded, 1);
+
+    let credentials = json!([
+        {
+            "refresh_token": "paid-batch-import-refresh",
+            "email": "paid-batch@example.com",
+            "account_id": PAID_ACCOUNT_ID,
+        }
+    ])
+    .to_string();
+    let response = harness
+        .client
+        .post(format!(
+            "{}/api/admin/provider-oauth/providers/{}/batch-import",
+            harness.gateway_url, harness.provider_id
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-codex-discovery")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-codex-discovery")
+        .json(&json!({
+            "credentials": credentials,
+        }))
+        .send()
+        .await
+        .expect("batch import request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value = response.json().await.expect("batch import JSON should parse");
+    assert_eq!(payload["success"], 1, "payload={payload}");
+    assert_eq!(payload["results"][0]["replaced"], false, "payload={payload}");
+    let new_key_id = payload["results"][0]["key_id"]
+        .as_str()
+        .expect("key_id should exist")
+        .to_string();
+
+    assert_new_codex_account_serves_advanced_without_restart(
+        &harness,
+        &new_key_id,
+        "trace-batch-import-after",
+    )
+    .await;
+
+    token_handle.abort();
+}
+
+#[test]
+fn codex_model_discovery_oauth_reauth_preserves_opt_out_and_lkg_without_refetch() {
+    run_async_test_on_large_stack(
+        "codex_model_discovery_oauth_reauth_preserves_opt_out_and_lkg_without_refetch",
+        codex_model_discovery_oauth_reauth_preserves_opt_out_and_lkg_without_refetch_impl(),
+    );
+}
+
+async fn codex_model_discovery_oauth_reauth_preserves_opt_out_and_lkg_without_refetch_impl() {
+    let (token_url, token_handle) = start_codex_oauth_token_server(
+        PAID_OAUTH_TOKEN,
+        "paid-reauth-refresh-token",
+        PAID_ACCOUNT_ID,
+        "paid-reauth@example.com",
+    )
+    .await;
+    let nonce = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let now_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_secs();
+
+    let mut builder = FixtureBuilder::new("oauth-reauth-optout");
+    builder.paid_account.auto_fetch_models = false;
+    builder.paid_account.account_user_id = Some("user-acct-codex-paid-synth");
+    builder.paid_account.expires_at_unix_secs = Some(1);
+    builder.paid_account.upstream_metadata = Some(json!({
+        DISCOVERY_NAMESPACE: {
+            "model_ids": [BASIC_MODEL, ADVANCED_MODEL]
+        }
+    }));
+    builder.oauth_token_url = Some(format!("{token_url}/oauth/token"));
+    builder.oauth_state_entries.push((
+        nonce.to_string(),
+        json!({
+            "nonce": nonce,
+            "key_id": "",
+            "provider_id": "provider-codex-discovery-oauth-reauth-optout",
+            "provider_type": "codex",
+            "pkce_verifier": "verifier-codex-reauth",
+            "initiated_by_user_id": "admin-codex-discovery",
+            "initiated_by_session_id": "session-codex-discovery",
+            "created_at": now_unix_secs,
+        }),
+    ));
+    let harness = builder.build().await;
+
+    let response = harness
+        .client
+        .post(format!(
+            "{}/api/admin/provider-oauth/providers/{}/complete",
+            harness.gateway_url, harness.provider_id
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-codex-discovery")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-codex-discovery")
+        .json(&json!({
+            "callback_url": format!("http://localhost:1455/auth/callback?code=reauth-code&state={nonce}"),
+        }))
+        .send()
+        .await
+        .expect("oauth reauth complete request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value = response.json().await.expect("reauth JSON should parse");
+    assert_eq!(payload["replaced"], true, "payload={payload}");
+    assert_eq!(payload["key_id"], harness.paid_key_id);
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let persisted = harness.load_stored_key(&harness.paid_key_id).await;
+    assert!(
+        !persisted.auto_fetch_models,
+        "re-auth must preserve explicit auto_fetch_models=false opt-out"
+    );
+    assert_eq!(
+        persisted
+            .upstream_metadata
+            .as_ref()
+            .and_then(|meta| meta.get(DISCOVERY_NAMESPACE)),
+        Some(&json!({ "model_ids": [BASIC_MODEL, ADVANCED_MODEL] })),
+        "re-auth must preserve LKG codex_model_discovery"
+    );
+    assert_eq!(
+        harness.counts().paid_catalog,
+        0,
+        "re-auth must not trigger post-create model fetch"
+    );
+
+    token_handle.abort();
+}
+
+#[test]
+fn codex_model_discovery_post_create_fetch_failure_records_error_and_denies_unverified_serving() {
+    run_async_test_on_large_stack(
+        "codex_model_discovery_post_create_fetch_failure_records_error_and_denies_unverified_serving",
+        codex_model_discovery_post_create_fetch_failure_records_error_and_denies_unverified_serving_impl(),
+    );
+}
+
+async fn codex_model_discovery_post_create_fetch_failure_records_error_and_denies_unverified_serving_impl(
+) {
+    let (token_url, token_handle) = start_codex_oauth_token_server(
+        PAID_OAUTH_TOKEN,
+        "paid-fail-refresh-token",
+        PAID_ACCOUNT_ID,
+        "paid-fail@example.com",
+    )
+    .await;
+    let mut builder = FixtureBuilder::new("oauth-create-fail");
+    builder.seed_paid_account = false;
+    builder.paid_catalog = UpstreamCatalogReply::server_error("upstream models unavailable");
+    builder.oauth_token_url = Some(format!("{token_url}/oauth/token"));
+    let harness = builder.build().await;
+    let free_summary = harness.fetch_key_models(&harness.free_key_id).await;
+    assert_eq!(free_summary.succeeded, 1);
+
+    let response = harness
+        .client
+        .post(format!(
+            "{}/api/admin/provider-oauth/providers/{}/import-refresh-token",
+            harness.gateway_url, harness.provider_id
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-codex-discovery")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-codex-discovery")
+        .json(&json!({
+            "refresh_token": "paid-fail-import-refresh",
+        }))
+        .send()
+        .await
+        .expect("single import request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: Value = response.json().await.expect("single import JSON should parse");
+    let new_key_id = payload["key_id"]
+        .as_str()
+        .expect("key_id should exist")
+        .to_string();
+
+    let persisted =
+        wait_for_key_model_fetch_completion(&harness, &new_key_id, Duration::from_secs(2)).await;
+    assert!(persisted.auto_fetch_models);
+    assert!(
+        persisted.last_models_fetch_error.is_some(),
+        "failed post-create discovery must record last_models_fetch_error"
+    );
+    assert!(
+        persisted
+            .upstream_metadata
+            .as_ref()
+            .and_then(|meta| meta.get(DISCOVERY_NAMESPACE))
+            .is_none(),
+        "failed post-create discovery must not fabricate codex_model_discovery"
+    );
+
+    let admin_keys = admin_list_provider_keys(&harness).await;
+    let admin_key = admin_keys
+        .iter()
+        .find(|item| item["id"].as_str() == Some(new_key_id.as_str()))
+        .expect("new key should appear in admin keys read endpoint");
+    assert!(admin_key["last_models_fetch_at"].is_string());
+    assert!(admin_key["last_models_fetch_error"].is_string());
+
+    let (status, body, _) = harness
+        .post_responses(
+            "trace-create-fail-after",
+            &json!({
+                "model": ADVANCED_MODEL,
+                "input": "Reply OK",
+                "stream": true
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body={body}");
+    assert_eq!(harness.counts().paid_gen, 0);
+
+    token_handle.abort();
 }

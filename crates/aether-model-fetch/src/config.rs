@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 const MODEL_FETCH_INTERVAL_MINUTES_DEFAULT: u64 = 1440;
 const MODEL_FETCH_INTERVAL_MINUTES_MIN: u64 = 60;
 const MODEL_FETCH_INTERVAL_MINUTES_MAX: u64 = 10080;
@@ -28,6 +30,16 @@ pub fn model_fetch_startup_delay_seconds() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(MODEL_FETCH_STARTUP_DELAY_SECONDS_DEFAULT)
+}
+
+pub fn pool_auto_publish_discovered_models_enabled(provider_config: Option<&Value>) -> bool {
+    provider_config
+        .and_then(Value::as_object)
+        .and_then(|config| config.get("pool_advanced"))
+        .and_then(Value::as_object)
+        .and_then(|pool_advanced| pool_advanced.get("auto_publish_discovered_models"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -73,5 +85,26 @@ mod tests {
         let _delay = set_test_env_var("MODEL_FETCH_STARTUP_DELAY_SECONDS", "3");
         assert!(!model_fetch_startup_enabled());
         assert_eq!(model_fetch_startup_delay_seconds(), 3);
+    }
+
+    #[test]
+    fn pool_auto_publish_flag_defaults_to_false_and_reads_bool() {
+        use super::pool_auto_publish_discovered_models_enabled;
+        use serde_json::json;
+
+        assert!(!pool_auto_publish_discovered_models_enabled(None));
+        assert!(!pool_auto_publish_discovered_models_enabled(Some(&json!({}))));
+        assert!(!pool_auto_publish_discovered_models_enabled(Some(&json!({
+            "pool_advanced": {}
+        }))));
+        assert!(!pool_auto_publish_discovered_models_enabled(Some(&json!({
+            "pool_advanced": { "auto_publish_discovered_models": false }
+        }))));
+        assert!(!pool_auto_publish_discovered_models_enabled(Some(&json!({
+            "pool_advanced": { "auto_publish_discovered_models": "true" }
+        }))));
+        assert!(pool_auto_publish_discovered_models_enabled(Some(&json!({
+            "pool_advanced": { "auto_publish_discovered_models": true }
+        }))));
     }
 }

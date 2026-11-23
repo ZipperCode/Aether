@@ -486,6 +486,25 @@ async fn record_stream_sync_failure(
         )
         .await;
     }
+    if candidate_status_code == Some(429) {
+        if let Err(err) = crate::orchestration::sync_codex_quota_from_429_response_headers(
+            state,
+            429,
+            report_context,
+            &payload.headers,
+        )
+        .await
+        {
+            warn!(
+                event_name = "codex_realtime_quota_sync_failed",
+                log_type = "ops",
+                trace_id = %payload.trace_id,
+                key_id = %plan.key_id,
+                error = ?err,
+                "gateway failed to persist codex realtime quota from stream failure 429 response headers"
+            );
+        }
+    }
     if failure_analysis.quota_exhaustion.is_none()
         && failure_analysis
             .antigravity_model_quota_exhaustion

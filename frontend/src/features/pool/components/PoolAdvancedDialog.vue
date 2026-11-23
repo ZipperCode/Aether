@@ -262,6 +262,41 @@
           </div>
         </div>
       </section>
+      <section class="space-y-4 rounded-2xl border border-border/60 bg-card/70 p-4 sm:p-5">
+        <div class="space-y-1">
+          <div class="flex flex-wrap items-center gap-2">
+            <h3 class="text-sm font-semibold">
+              {{ t('pool.advanced.modelDiscoveryTitle') }}
+            </h3>
+            <span class="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+              {{ t('pool.advanced.optInBadge') }}
+            </span>
+          </div>
+          <p class="text-xs leading-5 text-muted-foreground">
+            {{ t('pool.advanced.modelDiscoveryDesc') }}
+          </p>
+        </div>
+
+        <div class="flex flex-col gap-3 rounded-xl border border-border/60 bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div class="min-w-0 flex-1 space-y-1">
+            <Label
+              for="pool-auto-publish-discovered-models"
+              class="text-sm font-medium"
+            >
+              {{ t('pool.advanced.autoPublishDiscoveredModels') }}
+            </Label>
+            <p class="text-xs leading-5 text-muted-foreground">
+              {{ t('pool.advanced.autoPublishDiscoveredModelsDesc') }}
+            </p>
+          </div>
+          <Switch
+            id="pool-auto-publish-discovered-models"
+            v-model="form.auto_publish_discovered_models"
+            data-testid="pool-auto-publish-discovered-models"
+            class="shrink-0"
+          />
+        </div>
+      </section>
 
       <section class="space-y-4 rounded-2xl border border-border/60 bg-card/70 p-4 sm:p-5">
         <div class="space-y-1">
@@ -713,6 +748,7 @@ const form = ref({
   auto_remove_banned_keys: false,
   auto_remove_quota_exhausted_keys: false,
   ignore_exhausted_accounts: false,
+  auto_publish_discovered_models: false,
 })
 
 interface ClaudeFormState {
@@ -818,6 +854,7 @@ watch([() => props.modelValue, () => props.providerId], ([open]) => {
     auto_remove_banned_keys: cfg?.auto_remove_banned_keys ?? false,
     auto_remove_quota_exhausted_keys: cfg?.auto_remove_quota_exhausted_keys ?? false,
     ignore_exhausted_accounts: cfg?.ignore_exhausted_accounts ?? false,
+    auto_publish_discovered_models: cfg?.auto_publish_discovered_models === true,
   }
 
   const cc = props.currentClaudeConfig
@@ -830,7 +867,7 @@ watch([() => props.modelValue, () => props.providerId], ([open]) => {
     cache_ttl_override_target: cc?.cache_ttl_override_target ?? 'ephemeral',
     cli_only_enabled: cc?.cli_only_enabled ?? false,
   }
-})
+}, { immediate: true })
 
 async function handleSave() {
   const providerId = props.providerId
@@ -886,6 +923,7 @@ async function handleSave() {
       auto_remove_banned_keys: form.value.auto_remove_banned_keys,
       auto_remove_quota_exhausted_keys: form.value.auto_remove_quota_exhausted_keys,
       ignore_exhausted_accounts: form.value.ignore_exhausted_accounts,
+      auto_publish_discovered_models: form.value.auto_publish_discovered_models,
     })
 
     if (isAntigravity.value) {

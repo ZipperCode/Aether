@@ -924,6 +924,7 @@ export interface PoolAdvancedConfig {
   account_self_check_concurrency?: number | null
   auto_remove_banned_keys?: boolean
   auto_remove_quota_exhausted_keys?: boolean
+  auto_publish_discovered_models?: boolean
   antigravity?: AntigravityAdvancedConfig
 }
 

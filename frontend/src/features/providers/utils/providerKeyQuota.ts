@@ -79,6 +79,37 @@ export function getQuotaQueryStatusLabel(
   return null
 }
 
+/** Codex / Antigravity 运行时额度耗尽阻断可通过刷新额度核对并自动恢复，不强制要求人工恢复。 */
+export function isRecoverableRuntimeQuotaHoldProvider(providerType?: string | null): boolean {
+  const normalized = normalizeText(providerType)?.toLowerCase() || ''
+  return normalized === 'codex' || normalized === 'antigravity'
+}
+
+export function isRecoverableRuntimeQuotaHold(
+  providerType?: string | null,
+  isActive?: boolean | null,
+): boolean {
+  return isActive !== false && isRecoverableRuntimeQuotaHoldProvider(providerType)
+}
+
+export function getQuotaExhaustedSchedulingLabel(
+  providerType?: string | null,
+  isActive?: boolean | null,
+): string {
+  return isRecoverableRuntimeQuotaHold(providerType, isActive)
+    ? t('ui.quotaExhausted')
+    : t('pool.status.quotaExhaustedManualRecovery')
+}
+
+export function getQuotaExhaustedSchedulingHint(
+  providerType?: string | null,
+  isActive?: boolean | null,
+): string | null {
+  return isRecoverableRuntimeQuotaHold(providerType, isActive)
+    ? t('pool.status.quotaExhaustedRefreshHint')
+    : null
+}
+
 export interface QuotaStatusBadgeInfo {
   label: string
   tone: 'destructive' | 'warning' | 'neutral'
@@ -92,7 +123,14 @@ export function getQuotaStatusBadgeInfo(label?: string | null): QuotaStatusBadge
   if (!normalized) return null
 
   // 真实调度阻断或查询失败 -> 红色 destructive
-  if (normalized === '额度耗尽·需人工恢复' || normalized === '额度查询失败' || normalized === '查询失败') {
+  if (
+    normalized === '额度耗尽·需人工恢复'
+    || normalized === '额度耗尽'
+    || normalized === t('pool.status.quotaExhaustedManualRecovery')
+    || normalized === t('ui.quotaExhausted')
+    || normalized === '额度查询失败'
+    || normalized === '查询失败'
+  ) {
     return {
       label: normalized,
       tone: 'destructive',
@@ -128,11 +166,14 @@ export function getGenericQuotaStatusTitle(params: {
   quota?: QuotaStatusSnapshot | null
   scheduling?: { code?: string | null; blocked?: boolean | null; reason?: string | null; last_observed_at?: number | null } | null
   providerType?: string | null
+  isActive?: boolean | null
   locale?: string
 }): string {
-  const { quota, scheduling, providerType, locale } = params
+  const { quota, scheduling, providerType, isActive, locale } = params
   if (scheduling?.code === 'quota_exhausted' && scheduling.blocked === true) {
-    const parts = ['额度耗尽·需人工恢复']
+    const parts = [getQuotaExhaustedSchedulingLabel(providerType, isActive)]
+    const hint = getQuotaExhaustedSchedulingHint(providerType, isActive)
+    if (hint) parts.push(hint)
     if (scheduling.reason) parts.push(scheduling.reason)
     if (typeof scheduling.last_observed_at === 'number') {
       parts.push(new Date(scheduling.last_observed_at * 1000).toLocaleString(locale))

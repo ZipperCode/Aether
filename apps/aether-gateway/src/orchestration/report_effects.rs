@@ -586,6 +586,24 @@ async fn apply_local_sync_report_effect(state: &AppState, payload: &GatewaySyncR
                 "gateway failed to persist codex realtime quota from sync response headers"
             );
         }
+    } else if is_actual_upstream_http_429(payload.status_code, payload.report_context.as_ref()) {
+        if let Err(err) = sync_codex_quota_from_429_response_headers(
+            state,
+            payload.status_code,
+            payload.report_context.as_ref(),
+            &payload.headers,
+        )
+        .await
+        {
+            warn!(
+                event_name = "codex_realtime_quota_sync_failed",
+                log_type = "ops",
+                report_kind = %payload.report_kind,
+                report_request_id = %short_request_id(report_request_id(payload.report_context.as_ref())),
+                error = ?err,
+                "gateway failed to persist codex realtime quota from sync 429 response headers"
+            );
+        }
     }
     if let Err(err) = sync_grok_quota_from_report_context(
         state,
@@ -641,22 +659,42 @@ async fn apply_local_stream_report_effect(state: &AppState, payload: &GatewayStr
             false
         }
     };
-    if !websocket_quota_seen && (200..300).contains(&payload.status_code) {
-        if let Err(err) = sync_codex_quota_from_response_headers(
-            state,
-            payload.report_context.as_ref(),
-            &payload.headers,
-        )
-        .await
-        {
-            warn!(
-                event_name = "codex_realtime_quota_sync_failed",
-                log_type = "ops",
-                report_kind = %payload.report_kind,
-                report_request_id = %short_request_id(report_request_id(payload.report_context.as_ref())),
-                error = ?err,
-                "gateway failed to persist codex realtime quota from stream response headers"
-            );
+    if !websocket_quota_seen {
+        if (200..300).contains(&payload.status_code) {
+            if let Err(err) = sync_codex_quota_from_response_headers(
+                state,
+                payload.report_context.as_ref(),
+                &payload.headers,
+            )
+            .await
+            {
+                warn!(
+                    event_name = "codex_realtime_quota_sync_failed",
+                    log_type = "ops",
+                    report_kind = %payload.report_kind,
+                    report_request_id = %short_request_id(report_request_id(payload.report_context.as_ref())),
+                    error = ?err,
+                    "gateway failed to persist codex realtime quota from stream response headers"
+                );
+            }
+        } else if is_actual_upstream_http_429(payload.status_code, payload.report_context.as_ref()) {
+            if let Err(err) = sync_codex_quota_from_429_response_headers(
+                state,
+                payload.status_code,
+                payload.report_context.as_ref(),
+                &payload.headers,
+            )
+            .await
+            {
+                warn!(
+                    event_name = "codex_realtime_quota_sync_failed",
+                    log_type = "ops",
+                    report_kind = %payload.report_kind,
+                    report_request_id = %short_request_id(report_request_id(payload.report_context.as_ref())),
+                    error = ?err,
+                    "gateway failed to persist codex realtime quota from stream 429 response headers"
+                );
+            }
         }
     }
     if claude_code_quota_headers_reportable(payload.status_code) {
@@ -889,10 +927,60 @@ async fn delete_local_gemini_file_mapping(
     Ok(())
 }
 
+fn is_actual_upstream_http_429(status_code: u16, report_context: Option<&Value>) -> bool {
+    if report_context
+        .and_then(|context| context.get("transport_error"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return false;
+    }
+    if let Some(upstream_status) = report_context
+        .and_then(|context| context.get("upstream_response"))
+        .and_then(|response| response.get("status_code"))
+        .and_then(admin_provider_quota_pure::coerce_json_u64)
+    {
+        return upstream_status == 429;
+    }
+    status_code == 429
+}
+
+fn codex_429_has_explicit_exhaustion(parsed: &Value) -> bool {
+    if admin_provider_quota_pure::codex_rate_limit_metadata_exhausted(parsed) {
+        return true;
+    }
+    ["spark_primary_used_percent", "spark_secondary_used_percent"]
+        .into_iter()
+        .filter_map(|key| parsed.get(key))
+        .filter_map(admin_provider_quota_pure::coerce_json_f64)
+        .any(|used_percent| used_percent >= 100.0 - 1e-6)
+}
+
+pub(crate) async fn sync_codex_quota_from_429_response_headers(
+    state: &AppState,
+    status_code: u16,
+    report_context: Option<&Value>,
+    headers: &BTreeMap<String, String>,
+) -> Result<bool, GatewayError> {
+    if !is_actual_upstream_http_429(status_code, report_context) {
+        return Ok(false);
+    }
+    sync_codex_quota_from_response_headers_inner(state, report_context, headers, true).await
+}
+
 async fn sync_codex_quota_from_response_headers(
     state: &AppState,
     report_context: Option<&Value>,
     headers: &BTreeMap<String, String>,
+) -> Result<bool, GatewayError> {
+    sync_codex_quota_from_response_headers_inner(state, report_context, headers, false).await
+}
+
+async fn sync_codex_quota_from_response_headers_inner(
+    state: &AppState,
+    report_context: Option<&Value>,
+    headers: &BTreeMap<String, String>,
+    require_explicit_exhaustion: bool,
 ) -> Result<bool, GatewayError> {
     let now_unix_secs = current_unix_secs();
     let observed_at_unix_secs = report_context_u64(
@@ -918,6 +1006,9 @@ async fn sync_codex_quota_from_response_headers(
     }) else {
         return Ok(false);
     };
+    if require_explicit_exhaustion && !codex_429_has_explicit_exhaustion(&parsed) {
+        return Ok(false);
+    }
     sync_codex_quota_metadata_with_observation(
         state,
         report_context,
@@ -1384,6 +1475,131 @@ mod tests {
             .pop()
             .expect("key should exist");
         assert!(stored.upstream_metadata.is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_429_with_explicit_exhaustion_persists_and_installs_breaker_in_sync_and_stream() {
+        use crate::orchestration::codex_quota_breaker_blocks_candidate;
+
+        for (is_stream, key_id, account_id) in [
+            (false, "codex-429-sync-key", "acct-sync-429"),
+            (true, "codex-429-stream-key", "acct-stream-429"),
+        ] {
+            let state = codex_test_state(key_id);
+            let report_context = json!({
+                "key_id": key_id,
+                "provider_request_headers": {
+                    "ChatGPT-Account-ID": account_id
+                }
+            });
+            let headers = codex_headers(100.0, 2_000_000_000);
+            if is_stream {
+                let payload = GatewayStreamReportRequest {
+                    trace_id: "trace-429-stream".to_string(),
+                    report_kind: "openai_responses_stream_error".to_string(),
+                    report_context: Some(report_context),
+                    status_code: 429,
+                    headers,
+                    provider_body_base64: None,
+                    provider_body_state: None,
+                    client_body_base64: None,
+                    client_body_state: None,
+                    terminal_summary: None,
+                    telemetry: None,
+                };
+                apply_local_report_effect(&state, LocalReportEffect::Stream { payload: &payload })
+                    .await;
+            } else {
+                let payload = GatewaySyncReportRequest {
+                    trace_id: "trace-429-sync".to_string(),
+                    report_kind: "openai_responses_sync_error".to_string(),
+                    report_context: Some(report_context),
+                    status_code: 429,
+                    headers,
+                    body_json: None,
+                    client_body_json: None,
+                    body_base64: None,
+                    telemetry: None,
+                };
+                apply_local_report_effect(&state, LocalReportEffect::Sync { payload: &payload })
+                    .await;
+            }
+
+            let stored = stored_codex_metadata(&state, key_id).await;
+            assert_eq!(stored["primary_used_percent"], json!(100.0));
+            let candidate_headers =
+                BTreeMap::from([("chatgpt-account-id".to_string(), account_id.to_string())]);
+            assert!(codex_quota_breaker_blocks_candidate(
+                &state,
+                Some("codex"),
+                Some(key_id),
+                &candidate_headers,
+            )
+            .await
+            .expect("breaker lookup should succeed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_429_model_only_exhaustion_does_not_install_key_wide_breaker() {
+        use crate::orchestration::codex_quota_breaker_blocks_candidate;
+
+        let key_id = "codex-429-model-only-key";
+        let account_id = "acct-model-only-429";
+        let state = codex_test_state(key_id);
+        let headers = BTreeMap::from([
+            ("x-codex-plan-type".to_string(), "pro".to_string()),
+            ("x-codex-active-limit".to_string(), "bengalfox".to_string()),
+            ("x-codex-primary-used-percent".to_string(), "100".to_string()),
+            (
+                "x-codex-primary-reset-at".to_string(),
+                "2000000000".to_string(),
+            ),
+            (
+                "x-codex-bengalfox-limit-name".to_string(),
+                "GPT-5.3-Codex-Spark".to_string(),
+            ),
+            (
+                "x-codex-bengalfox-primary-used-percent".to_string(),
+                "100".to_string(),
+            ),
+            (
+                "x-codex-bengalfox-primary-reset-at".to_string(),
+                "2000000000".to_string(),
+            ),
+        ]);
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-429-model-only".to_string(),
+            report_kind: "openai_responses_sync_error".to_string(),
+            report_context: Some(json!({
+                "key_id": key_id,
+                "provider_request_headers": {
+                    "ChatGPT-Account-ID": account_id
+                }
+            })),
+            status_code: 429,
+            headers,
+            body_json: None,
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+
+        apply_local_report_effect(&state, LocalReportEffect::Sync { payload: &payload }).await;
+
+        let stored = stored_codex_metadata(&state, key_id).await;
+        assert_eq!(stored["spark_primary_used_percent"], json!(100.0));
+        assert!(stored.get("primary_used_percent").is_none());
+        let candidate_headers =
+            BTreeMap::from([("chatgpt-account-id".to_string(), account_id.to_string())]);
+        assert!(!codex_quota_breaker_blocks_candidate(
+            &state,
+            Some("codex"),
+            Some(key_id),
+            &candidate_headers,
+        )
+        .await
+        .expect("breaker lookup should succeed"));
     }
 
     #[tokio::test]

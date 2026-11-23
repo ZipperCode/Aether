@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::clock::current_unix_secs;
+use crate::clock::{current_unix_ms, current_unix_secs};
 use crate::{AppState, GatewayError};
 
 const CODEX_QUOTA_BREAKER_KEY_PREFIX: &str = "aether:codex:quota-breaker:v1";
@@ -38,17 +38,41 @@ pub(crate) async fn install_codex_quota_exhaustion_breaker(
         return Ok(false);
     }
 
-    let now_unix_secs = current_unix_secs();
+    let now_unix_ms = current_unix_ms();
+    let now_unix_secs = now_unix_ms / 1_000;
+    let observed_at_unix_ms = report_context
+        .and_then(|context| context.get("provider_response_headers_observed_at_unix_ms"))
+        .and_then(aether_admin::provider::quota::coerce_json_u64)
+        .filter(|value| *value > 0)
+        .unwrap_or(now_unix_ms);
+    let request_started_at_unix_ms = report_context
+        .and_then(|context| context.get("provider_request_started_at_unix_ms"))
+        .and_then(aether_admin::provider::quota::coerce_json_u64)
+        .filter(|value| *value > 0);
+    let incoming_evidence_unix_ms = request_started_at_unix_ms.unwrap_or(observed_at_unix_ms);
     let (ttl_seconds, reset_at_unix_secs) = codex_quota_breaker_ttl(quota_metadata, now_unix_secs);
-    let value = json!({
+    let mut payload = json!({
         "version": 1,
         "observed_at": now_unix_secs,
+        "observed_at_unix_ms": observed_at_unix_ms,
         "reset_at": reset_at_unix_secs,
         "source": source,
-    })
-    .to_string();
+    });
+    if let Some(started_at) = request_started_at_unix_ms {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("request_started_at_unix_ms".to_string(), json!(started_at));
+        }
+    }
+    let value = payload.to_string();
 
     for key in &keys {
+        if let Some(existing) = state.runtime_kv_get(key).await? {
+            if codex_quota_breaker_evidence_unix_ms(&existing)
+                .is_some_and(|existing_ms| existing_ms > incoming_evidence_unix_ms)
+            {
+                continue;
+            }
+        }
         state.runtime_kv_setex(key, &value, ttl_seconds).await?;
     }
     info!(
@@ -86,6 +110,93 @@ pub(crate) async fn codex_quota_breaker_blocks_candidate(
         }
     }
     Ok(false)
+}
+
+/// Clears stale Codex quota breaker entries after a confirmed positive OAuth
+/// refresh while preserving any breaker evidence observed at or after
+/// `refresh_started_at_unix_ms`.
+pub(crate) async fn clear_codex_quota_breaker_after_refresh(
+    state: &AppState,
+    key_id: &str,
+    account_id: Option<&str>,
+    refresh_started_at_unix_ms: u64,
+) -> Result<(), GatewayError> {
+    if refresh_started_at_unix_ms == 0 {
+        return Ok(());
+    }
+    let keys = codex_quota_breaker_keys(Some(key_id), account_id);
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    let mut cleared_count = 0usize;
+    for key in &keys {
+        let Some(raw) = state.runtime_kv_get(key).await? else {
+            continue;
+        };
+        if !codex_quota_breaker_is_older_than(&raw, refresh_started_at_unix_ms) {
+            continue;
+        }
+        let Some(taken) = state.runtime_kv_getdel(key).await? else {
+            continue;
+        };
+        if codex_quota_breaker_is_older_than(&taken, refresh_started_at_unix_ms) {
+            cleared_count += 1;
+        } else {
+            let ttl_seconds = codex_quota_breaker_restore_ttl_seconds(&taken, current_unix_secs());
+            state.runtime_kv_setex(key, &taken, ttl_seconds).await?;
+        }
+    }
+
+    if cleared_count > 0 {
+        info!(
+            event_name = "codex_account_quota_breaker_cleared_after_refresh",
+            log_type = "event",
+            cleared_count,
+            refresh_started_at_unix_ms,
+            "gateway cleared stale Codex quota exhaustion breaker after positive OAuth refresh"
+        );
+    }
+
+    Ok(())
+}
+
+fn codex_quota_breaker_evidence_unix_ms(raw: &str) -> Option<u64> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let object = value.as_object()?;
+    object
+        .get("request_started_at_unix_ms")
+        .and_then(aether_admin::provider::quota::coerce_json_u64)
+        .or_else(|| {
+            object
+                .get("observed_at_unix_ms")
+                .and_then(aether_admin::provider::quota::coerce_json_u64)
+        })
+        .or_else(|| {
+            object
+                .get("observed_at")
+                .and_then(aether_admin::provider::quota::coerce_json_u64)
+                .map(|secs| secs.saturating_mul(1_000))
+        })
+}
+
+fn codex_quota_breaker_is_older_than(raw: &str, refresh_started_at_unix_ms: u64) -> bool {
+    codex_quota_breaker_evidence_unix_ms(raw)
+        .is_some_and(|evidence_unix_ms| evidence_unix_ms < refresh_started_at_unix_ms)
+}
+
+fn codex_quota_breaker_restore_ttl_seconds(raw: &str, now_unix_secs: u64) -> u64 {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("reset_at")
+                .and_then(aether_admin::provider::quota::coerce_json_u64)
+        })
+        .and_then(|reset_at| reset_at.checked_sub(now_unix_secs))
+        .filter(|ttl| *ttl > 0)
+        .unwrap_or(CODEX_QUOTA_BREAKER_FALLBACK_TTL_SECONDS)
+        .clamp(1, CODEX_QUOTA_BREAKER_MAX_TTL_SECONDS)
 }
 
 fn codex_quota_breaker_keys_from_report_context(report_context: Option<&Value>) -> Vec<String> {
@@ -266,9 +377,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        codex_quota_breaker_blocks_candidate, codex_quota_breaker_keys,
-        codex_quota_breaker_keys_from_report_context, codex_quota_breaker_ttl,
-        codex_quota_exhaustion_reset_at, install_codex_quota_exhaustion_breaker,
+        clear_codex_quota_breaker_after_refresh, codex_quota_breaker_blocks_candidate,
+        codex_quota_breaker_keys, codex_quota_breaker_keys_from_report_context,
+        codex_quota_breaker_ttl, codex_quota_exhaustion_reset_at,
+        install_codex_quota_exhaustion_breaker,
     };
     use crate::AppState;
 
@@ -393,6 +505,78 @@ mod tests {
             Some("codex"),
             Some("key-second"),
             &other_account,
+        )
+        .await
+        .expect("breaker lookup should succeed"));
+    }
+
+    #[tokio::test]
+    async fn clear_after_refresh_clears_older_breaker_and_preserves_newer_evidence() {
+        let state = AppState::new().expect("gateway state should build");
+        let quota_metadata = json!({
+            "allowed": false,
+            "limit_reached": true,
+            "primary_used_percent": 100,
+            "primary_reset_after_seconds": 60,
+        });
+        let older_context = json!({
+            "key_id": "key-first",
+            "provider_request_started_at_unix_ms": 1_000u64,
+            "provider_response_headers_observed_at_unix_ms": 1_100u64,
+            "provider_request_headers": {
+                "ChatGPT-Account-ID": "account-123"
+            }
+        });
+        assert!(install_codex_quota_exhaustion_breaker(
+            &state,
+            Some(&older_context),
+            &quota_metadata,
+            "test",
+        )
+        .await
+        .expect("older breaker installation should succeed"));
+
+        clear_codex_quota_breaker_after_refresh(&state, "key-first", Some("account-123"), 2_000)
+            .await
+            .expect("clearing older breaker should succeed");
+
+        let headers =
+            BTreeMap::from([("chatgpt-account-id".to_string(), "account-123".to_string())]);
+        assert!(!codex_quota_breaker_blocks_candidate(
+            &state,
+            Some("codex"),
+            Some("key-first"),
+            &headers,
+        )
+        .await
+        .expect("breaker lookup should succeed"));
+
+        let newer_context = json!({
+            "key_id": "key-first",
+            "provider_request_started_at_unix_ms": 2_000u64,
+            "provider_response_headers_observed_at_unix_ms": 2_050u64,
+            "provider_request_headers": {
+                "ChatGPT-Account-ID": "account-123"
+            }
+        });
+        assert!(install_codex_quota_exhaustion_breaker(
+            &state,
+            Some(&newer_context),
+            &quota_metadata,
+            "test",
+        )
+        .await
+        .expect("newer breaker installation should succeed"));
+
+        clear_codex_quota_breaker_after_refresh(&state, "key-first", Some("account-123"), 2_000)
+            .await
+            .expect("refresh clear should preserve newer breaker");
+
+        assert!(codex_quota_breaker_blocks_candidate(
+            &state,
+            Some("codex"),
+            Some("key-first"),
+            &headers,
         )
         .await
         .expect("breaker lookup should succeed"));

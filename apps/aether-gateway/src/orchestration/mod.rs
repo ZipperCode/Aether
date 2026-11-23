@@ -52,10 +52,10 @@ pub(crate) use self::classifier::{
     LocalTransportFailoverClassification,
 };
 pub(crate) use self::codex_quota_breaker::{
-    codex_account_id_from_headers, codex_model_quota_exhaustion_reset_at,
-    codex_quota_breaker_blocks_candidate, codex_quota_exhaustion_reset_at,
-    install_codex_quota_exhaustion_breaker, log_codex_quota_breaker_check_failure,
-    log_codex_quota_breaker_install_failure,
+    clear_codex_quota_breaker_after_refresh, codex_account_id_from_headers,
+    codex_model_quota_exhaustion_reset_at, codex_quota_breaker_blocks_candidate,
+    codex_quota_exhaustion_reset_at, install_codex_quota_exhaustion_breaker,
+    log_codex_quota_breaker_check_failure, log_codex_quota_breaker_install_failure,
 };
 pub(crate) use self::effects::{
     apply_local_execution_effect, apply_local_stream_failure_effects,
@@ -90,7 +90,8 @@ pub(crate) use self::recovery::{
 pub(crate) use self::report_effects::clear_local_report_effect_caches_for_tests;
 pub(crate) use self::report_effects::{
     apply_local_report_effect, store_local_gemini_file_mapping,
-    sync_codex_websocket_quota_metadata, LocalReportEffect,
+    sync_codex_quota_from_429_response_headers, sync_codex_websocket_quota_metadata,
+    LocalReportEffect,
 };
 
 pub(crate) async fn resolve_local_failover_analysis_for_attempt(

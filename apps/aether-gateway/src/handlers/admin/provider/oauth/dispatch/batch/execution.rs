@@ -25,7 +25,7 @@ use crate::handlers::admin::provider::oauth::provisioning::{
 };
 use crate::handlers::admin::provider::oauth::runtime::{
     resolve_provider_oauth_runtime_endpoints,
-    spawn_provider_oauth_account_state_refresh_after_update,
+    spawn_provider_oauth_account_state_refresh_after_persistence,
 };
 use crate::handlers::admin::provider::oauth::state::{
     admin_provider_oauth_template, exchange_admin_provider_oauth_refresh_token,
@@ -743,11 +743,12 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
         };
         release_codex_oauth_account_locks(state, codex_oauth_account_leases).await;
 
-        spawn_provider_oauth_account_state_refresh_after_update(
+        spawn_provider_oauth_account_state_refresh_after_persistence(
             state.cloned_app(),
             provider.clone(),
             persisted_key.id.clone(),
             request_proxy.clone(),
+            replaced,
         );
 
         success += 1;

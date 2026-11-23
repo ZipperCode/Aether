@@ -460,7 +460,11 @@ impl GlobalModelWriteRepository for InMemoryGlobalModelReadRepository {
             .admin_provider_model_items
             .write()
             .expect("admin provider model repository lock");
-        if items.iter().any(|item| item.id == record.model.id) {
+        if items.iter().any(|item| {
+            item.id == record.model.id
+                || (item.provider_id == record.model.provider_id
+                    && item.provider_model_name == record.model.provider_model_name)
+        }) {
             return Err(DataLayerError::UnexpectedValue(
                 "provider model already exists".to_string(),
             ));
@@ -713,11 +717,22 @@ impl GlobalModelWriteRepository for InMemoryGlobalModelReadRepository {
             Some(1_711_000_000),
             Some(1_711_000_000),
         )?;
-        self.admin_global_model_items
+        let mut items = self
+            .admin_global_model_items
             .write()
-            .expect("admin global model repository lock")
-            .push(stored);
-        self.get_admin_global_model_by_id(&record.id).await
+            .expect("admin global model repository lock");
+        // Two simultaneous account discoveries must agree on the same global ID,
+        // just as they do under PostgreSQL's unique model-name constraint.
+        if items
+            .iter()
+            .any(|item| item.id == stored.id || item.name == stored.name)
+        {
+            return Err(DataLayerError::UnexpectedValue(
+                "global model already exists".to_string(),
+            ));
+        }
+        items.push(stored.clone());
+        Ok(Some(stored))
     }
 
     async fn update_admin_global_model(
@@ -1054,6 +1069,39 @@ mod tests {
             None,
         )
         .expect("provider model should build")
+    }
+
+    #[tokio::test]
+    async fn discovered_names_cannot_be_inserted_again_under_a_different_id() {
+        let repository = InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_admin_global_models([sample_admin_global_model()])
+            .with_admin_provider_models([sample_admin_provider_model()])
+            .with_endpoint_provider_ids([("endpoint-1", "provider-1")]);
+        let global = CreateAdminGlobalModelRecord::new(
+            "global-2".into(),
+            "gpt-5".into(),
+            "GPT 5".into(),
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(repository.create_admin_global_model(&global).await.is_err());
+        let model = CreateAdminProviderModelWithBindingsRecord::new(
+            UpsertAdminProviderModelRecord {
+                id: "model-2".into(),
+                ..sample_provider_model_record()
+            },
+            vec!["endpoint-1".into()],
+            "discovered".into(),
+        )
+        .unwrap();
+        assert!(repository
+            .create_admin_provider_model_with_bindings(&model)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
