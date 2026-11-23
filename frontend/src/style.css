@@ -986,6 +986,16 @@ body[theme-mode='dark'] .literary-annotation {
     @apply min-w-0 flex-1 px-4 py-6 sm:px-6 lg:px-8 lg:py-8;
   }
 
+  /* Use the table's existing horizontal scroller for both axes so its header and columns stay aligned. */
+  :where(.admin-table-lists div:has(> table > thead)) {
+    max-height: calc(100dvh - 6rem);
+    overflow: auto;
+  }
+
+  .admin-table-lists table > thead {
+    @apply sticky top-0 z-10 bg-card;
+  }
+
   .surface-glass {
     @apply border rounded-3xl backdrop-blur-2xl;
     background: rgba(250, 250, 247, 0.82);

@@ -1312,7 +1312,7 @@ const contentClasses = computed(() => {
 const mainClasses = computed(() => {
     // 移动端需要 pt-24 来避开固定头部（约69px）+ 额外间距
     // 桌面端内容在 sticky header 下方，但需要一些内边距让内容不紧贴
-    return `pt-24 lg:pt-6`
+    return route.meta.requiresAdmin ? 'pt-24 lg:pt-6 admin-table-lists' : 'pt-24 lg:pt-6'
 })
 
 </script>
