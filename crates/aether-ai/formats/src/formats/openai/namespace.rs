@@ -199,6 +199,13 @@ pub(crate) enum LoweredToolChoiceName {
     Ambiguous,
 }
 
+/// Resolution of a qualified Responses `tool_choice` (`namespace` + `name` + `type`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum QualifiedToolChoiceTarget {
+    Function(String),
+    NativeCustom(String),
+}
+
 impl NamespaceToolAliases {
     /// Build the request-local lowering for a Responses request. Fails closed
     /// when a tool declaration or a discovered tool spec has no lossless
@@ -426,6 +433,84 @@ impl NamespaceToolAliases {
                     && tool.identity.name == name
                     && tool.lowered_as_function
             }),
+        }
+    }
+
+    /// Whether a history tool call (`custom_tool_call` vs `function_call`) matches
+    /// the declared/discovered tool kind in this request inventory. Undeclared
+    /// flat history tools remain allowed for compatibility.
+    pub(crate) fn tool_use_matches_declared_kind(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        is_custom_call: bool,
+    ) -> bool {
+        match namespace.and_then(normalize_namespace) {
+            Some(namespace) => self
+                .tools
+                .iter()
+                .find(|tool| tool.namespace == namespace && tool.name == name)
+                .is_some_and(|tool| (tool.kind == LoweredToolKind::CustomText) == is_custom_call),
+            None => match self.flat.iter().find(|tool| tool.identity.name == name) {
+                Some(tool) => match tool.identity.kind {
+                    LoweredToolKind::CustomText => is_custom_call,
+                    LoweredToolKind::Function => !is_custom_call,
+                    LoweredToolKind::ToolSearch => false,
+                },
+                None => true,
+            },
+        }
+    }
+
+    /// Resolve a qualified Responses `tool_choice` (`type`, `namespace`, `name`)
+    /// against the offered inventory.
+    pub(crate) fn resolve_qualified_tool_choice(
+        &self,
+        object: &Map<String, Value>,
+    ) -> Option<QualifiedToolChoiceTarget> {
+        if object.len() != 3 {
+            return None;
+        }
+        let kind = object.get("type")?.as_str()?.trim();
+        let namespace = object.get("namespace")?.as_str()?.trim();
+        let name = object.get("name")?.as_str()?.trim();
+        if namespace.is_empty() || name.is_empty() {
+            return None;
+        }
+        match normalize_namespace(namespace) {
+            Some(namespace) => {
+                let tool = self
+                    .tools
+                    .iter()
+                    .find(|tool| tool.namespace == namespace && tool.name == name)?;
+                let expected_kind = match tool.kind {
+                    LoweredToolKind::CustomText => "custom",
+                    LoweredToolKind::Function => "function",
+                    LoweredToolKind::ToolSearch => return None,
+                };
+                (kind == expected_kind)
+                    .then(|| QualifiedToolChoiceTarget::Function(tool.chat_name.clone()))
+            }
+            None => {
+                let tool = self.flat.iter().find(|tool| tool.identity.name == name)?;
+                match (tool.identity.kind, kind) {
+                    (LoweredToolKind::Function, "function") => Some(
+                        QualifiedToolChoiceTarget::Function(tool.provider_name.clone()),
+                    ),
+                    (LoweredToolKind::CustomText, "custom") => {
+                        if tool.lowered_as_function {
+                            Some(QualifiedToolChoiceTarget::Function(
+                                tool.provider_name.clone(),
+                            ))
+                        } else {
+                            Some(QualifiedToolChoiceTarget::NativeCustom(
+                                tool.provider_name.clone(),
+                            ))
+                        }
+                    }
+                    _ => None,
+                }
+            }
         }
     }
 

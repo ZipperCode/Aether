@@ -19,8 +19,8 @@ use crate::formats::shared::sse::{encode_json_sse, SseRecord, SseRecordReader};
 use crate::formats::shared::stream_core::common::{
     canonical_usage_from_claude_usage, canonical_usage_from_gemini_usage,
     canonical_usage_from_openai_usage, decode_json_data_line, openai_stream_terminal_error_body,
-    openai_stream_terminal_error_message, unsupported_stream_event_message, CanonicalStreamEvent,
-    CanonicalStreamFrame, CanonicalUsage,
+    openai_stream_terminal_error_message, required_stream_end, unsupported_stream_event_message,
+    CanonicalStreamEvent, CanonicalStreamFrame, CanonicalUsage,
 };
 use crate::formats::shared::AiSurfaceFinalizeError;
 use crate::formats::shared::{resolve_gemini_stream_wire_mode, GeminiStreamWireMode};
@@ -30,6 +30,7 @@ const PROVIDER_STREAM_FINISH_ERROR_MESSAGE: &str =
 
 #[derive(Default)]
 pub struct StreamingStandardFormatMatrix {
+    required_end: Option<&'static str>,
     provider: Option<ProviderStreamParser>,
     client: Option<ClientStreamEmitter>,
     propagated_actual_service_tier: Option<String>,
@@ -103,6 +104,11 @@ impl StreamingStandardFormatMatrix {
             return Ok(Vec::new());
         }
         self.ensure_initialized(report_context);
+        let missing_end = self.required_end.filter(|_| {
+            self.provider
+                .as_ref()
+                .is_some_and(|provider| !provider.observed_end())
+        });
         let finished = {
             let Some(provider) = self.provider.as_mut() else {
                 return Ok(Vec::new());
@@ -134,6 +140,18 @@ impl StreamingStandardFormatMatrix {
                 client.set_actual_service_tier(tier.as_deref());
             }
         }
+        // Preserve more specific EOF errors (e.g. unfinished Gemini function arguments).
+        if let Some(marker) = missing_end.filter(|_| !frames.iter().any(|frame| matches!(
+            &frame.event, CanonicalStreamEvent::UnknownEvent(payload) if openai_stream_terminal_error_body(payload).is_some()
+        ))) {
+            self.terminated = true;
+            let message = format!("Upstream stream ended before {marker}");
+            let body = build_core_error_body_for_client_format(
+                &client_api_format_for_context(report_context), &message,
+                Some("stream_missing_terminal_event"), LocalCoreSyncErrorKind::ServerError,
+            ).ok_or_else(|| AiSurfaceFinalizeError::new(message))?;
+            return self.emit_error(body);
+        }
         let mut out = self.emit_frames(report_context, frames)?;
         if self.terminated {
             return Ok(out);
@@ -161,6 +179,7 @@ impl StreamingStandardFormatMatrix {
         let provider_api_format = provider_api_format_for_context(report_context);
         let client_api_format = client_api_format_for_context(report_context);
 
+        self.required_end = required_stream_end(&provider_api_format, report_context);
         self.provider = ProviderStreamParser::for_api_format(provider_api_format.as_str());
         self.client =
             ClientStreamEmitter::for_api_format(client_api_format.as_str(), report_context);
@@ -527,13 +546,22 @@ impl StreamingStandardTerminalObserver {
                 let gap = self.observation_error.is_some();
                 let observed_end_after_gap = gap && (confirmed_end || provider.observed_end());
                 // EOF alone cannot establish success across a gap in observation.
-                if gap && !observed_end_after_gap {
+                let required_end = required_stream_end(
+                    &provider_api_format_for_context(report_context),
+                    report_context,
+                );
+                if !provider.observed_end()
+                    && !observed_end_after_gap
+                    && (gap || required_end.is_some())
+                {
                     let summary = self.latest_summary.get_or_insert_with(Default::default);
                     if summary.parser_error.is_none() {
                         summary.observed_finish = false;
                         summary.finish_reason = None;
-                        summary.parser_error =
-                            Some("Upstream stream ended without a confirmed terminal event".into());
+                        summary.parser_error = Some(required_end.map_or_else(
+                            || "Upstream stream ended without a confirmed terminal event".into(),
+                            |marker| format!("Upstream stream ended before {marker}"),
+                        ));
                     }
                     return Ok(());
                 }
@@ -1166,6 +1194,143 @@ mod tests {
 
     fn data_line(value: Value) -> Vec<u8> {
         format!("data: {}\n", value).into_bytes()
+    }
+
+    #[test]
+    fn upstream_eof_requires_a_wire_terminal_only_on_identified_routes() {
+        let chat = json!({"choices":[{"index":0,"delta":{"content":"partial"}}]});
+        let gemini = json!({"candidates":[{"content":{"parts":[{"text":"partial"}]}}]});
+        for (source, url, chunk, missing) in [
+            (
+                "openai:chat",
+                "https://api.openai.com/v1/chat/completions",
+                chat.clone(),
+                true,
+            ),
+            (
+                "openai:chat",
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                chat.clone(),
+                true,
+            ),
+            (
+                "openai:chat",
+                "https://proxy.example/v1/chat/completions",
+                chat,
+                false,
+            ),
+            (
+                "gemini:generate_content",
+                "https://us-central1-aiplatform.googleapis.com/v1",
+                gemini.clone(),
+                true,
+            ),
+            (
+                "gemini:generate_content",
+                "https://generativelanguage.googleapis.com/v1beta",
+                json!({"candidates":[{"finishReason":" ","content":{"parts":[{"text":"partial"}]}}]}),
+                true,
+            ),
+            (
+                "gemini:generate_content",
+                "https://proxy.example/v1",
+                gemini,
+                false,
+            ),
+            (
+                "claude:messages",
+                "https://api.anthropic.com/v1/messages",
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}),
+                true,
+            ),
+            (
+                "openai:responses",
+                "https://proxy.example/v1/responses",
+                json!({"type":"response.output_text.delta","delta":"partial"}),
+                true,
+            ),
+        ] {
+            let mut ctx = report_context(source, "claude:messages");
+            ctx["upstream_url"] = json!(url);
+            let mut matrix = StreamingStandardFormatMatrix::default();
+            let mut observer = StreamingStandardTerminalObserver::default();
+            matrix
+                .transform_line(&ctx, data_line(chunk.clone()))
+                .unwrap();
+            observer.push_line(&ctx, data_line(chunk)).unwrap();
+            let tail = String::from_utf8(matrix.finish(&ctx).unwrap()).unwrap();
+            assert_eq!(
+                tail.contains("event: error"),
+                missing,
+                "{source} {url}: {tail}"
+            );
+            assert_eq!(
+                tail.contains("event: message_stop"),
+                !missing,
+                "{source} {url}: {tail}"
+            );
+            let summary = observer.finish(&ctx).unwrap().unwrap();
+            assert_eq!(summary.parser_error.is_some(), missing, "{source} {url}");
+            assert_eq!(summary.observed_finish, !missing, "{source} {url}");
+        }
+    }
+
+    #[test]
+    fn chat_done_marker_allows_the_existing_successful_flush() {
+        let mut ctx = report_context("openai:chat", "claude:messages");
+        ctx["upstream_url"] = json!("https://api.openai.com/v1/chat/completions");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        matrix
+            .transform_line(
+                &ctx,
+                data_line(json!({"choices":[{"delta":{"content":"whole"}}]})),
+            )
+            .unwrap();
+        let before_done = matrix
+            .transform_line(
+                &ctx,
+                data_line(json!({"usage":{"completion_tokens":6,"prompt_tokens":2}})),
+            )
+            .unwrap();
+        assert!(!String::from_utf8(before_done)
+            .unwrap()
+            .contains("message_stop"));
+        let mut end = matrix
+            .transform_line(&ctx, b"data: [DONE]\r\n".to_vec())
+            .unwrap();
+        end.extend(matrix.finish(&ctx).unwrap());
+        let tail = String::from_utf8(end).unwrap();
+        assert!(tail.contains("event: message_stop"), "{tail}");
+        assert!(tail.contains("\"output_tokens\":6"), "{tail}");
+    }
+
+    #[test]
+    fn early_chat_usage_does_not_replace_a_later_length_reason() {
+        let mut ctx = report_context("openai:chat", "claude:messages");
+        ctx["upstream_url"] = json!("https://api.openai.com/v1/chat/completions");
+        let mut matrix = StreamingStandardFormatMatrix::default();
+        let mut wire = Vec::new();
+        for chunk in [
+            json!({"choices":[{"delta":{"content":"partial"}}]}),
+            json!({"usage":{"completion_tokens":6,"prompt_tokens":2}}),
+            json!({"choices":[{"delta":{},"finish_reason":"length"}]}),
+            json!({"choices":[]}),
+        ] {
+            wire.extend(matrix.transform_line(&ctx, data_line(chunk)).unwrap());
+        }
+        wire.extend(
+            matrix
+                .transform_line(&ctx, b"data: [DONE]\n".to_vec())
+                .unwrap(),
+        );
+        wire.extend(matrix.finish(&ctx).unwrap());
+        let events = json_data_events(&wire);
+        let finish = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(finish["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(finish["usage"]["output_tokens"], 6);
     }
 
     /// 提取测试输出中的 JSON `data:` 事件，并忽略协议终止标记。
@@ -4002,20 +4167,18 @@ mod structured_entry_tests {
         );
     }
 
-    /// 没有任何供应商终态事件。注意 `finish()` 会补一个 `stop`（这是 HTTP 与
-    /// WebSocket 共享的既有行为，C5 不改），所以 `observed_finish` 为真而 usage
-    /// 缺失——真正的「缺终态」判定看的是 usage 与被捕获的 body。这里要钉住的是
-    /// 两条入口在这种不完整序列上仍然给出同一个摘要。
+    /// HTTP 和 WebSocket 均不能从部分 Responses 内容推断成功结束。
     #[test]
     fn a_missing_terminal_agrees_across_both_entries() {
         let events = vec![created(), text_delta("truncated")];
         assert_entries_agree("a missing terminal", &events);
         let summary = summary_via_push_event(&events);
-        assert_eq!(summary.finish_reason.as_deref(), Some("stop"));
-        assert!(
-            summary.standardized_usage.is_none(),
-            "a synthesized finish carries no usage"
-        );
+        assert!(!summary.observed_finish);
+        assert!(summary
+            .parser_error
+            .as_deref()
+            .unwrap()
+            .contains("Responses terminal event"));
     }
 
     #[test]
@@ -4043,7 +4206,7 @@ mod structured_entry_tests {
             .parser_error
             .as_deref()
             .unwrap()
-            .contains("without a confirmed terminal event"));
+            .contains("Responses terminal event"));
         assert!(observe(b"", true).parser_error.is_none());
 
         let failure = observe(

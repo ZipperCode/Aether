@@ -4,7 +4,7 @@ use crate::{
     formats::{
         context::FormatContext,
         openai::{
-            namespace::{LoweredToolChoiceName, NamespaceToolAliases},
+            namespace::{LoweredToolChoiceName, NamespaceToolAliases, QualifiedToolChoiceTarget},
             tool_lowering::{
                 custom_tool_function_arguments, ToolLoweringError, ToolLoweringTarget,
             },
@@ -14,14 +14,15 @@ use crate::{
         canonical_extension_object_mut, canonical_message_to_openai_chat_messages,
         canonical_response_format_to_openai, canonical_tool_choice_to_openai,
         canonical_tool_is_openai_custom, canonical_tool_to_openai,
-        clear_openai_custom_tool_call_marker, is_claude_tool_result, namespace_extension_object,
-        openai_content_text, openai_extensions, openai_generation_config,
-        openai_message_content_blocks, openai_response_format_to_canonical,
-        openai_responses_extension, openai_role_to_canonical, openai_tool_choice_raw_to_chat,
-        openai_tool_choice_to_canonical, openai_tools_to_canonical, write_openai_generation_config,
-        CanonicalContentBlock, CanonicalInstruction, CanonicalMessage, CanonicalRequest,
-        CanonicalRole, CanonicalThinkingConfig, CanonicalToolChoice, CanonicalToolDefinition,
-        OPENAI_RESPONSES_EXTENSION_NAMESPACE, OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
+        clear_openai_custom_tool_call_marker, is_claude_tool_result, is_openai_custom_tool_call,
+        namespace_extension_object, openai_content_text, openai_extensions,
+        openai_generation_config, openai_message_content_blocks,
+        openai_response_format_to_canonical, openai_responses_extension, openai_role_to_canonical,
+        openai_tool_choice_raw_to_chat, openai_tool_choice_to_canonical, openai_tools_to_canonical,
+        write_openai_generation_config, CanonicalContentBlock, CanonicalInstruction,
+        CanonicalMessage, CanonicalRequest, CanonicalRole, CanonicalThinkingConfig,
+        CanonicalToolChoice, CanonicalToolDefinition, OPENAI_RESPONSES_EXTENSION_NAMESPACE,
+        OPENAI_RESPONSES_LEGACY_EXTENSION_NAMESPACE,
     },
 };
 
@@ -324,8 +325,77 @@ fn raw_tool_choice_to_openai_chat_for_request(
     raw: &Value,
     aliases: &NamespaceToolAliases,
 ) -> Option<Value> {
+    if let Some(object) = raw.as_object() {
+        if object.contains_key("namespace") {
+            return resolve_qualified_tool_choice(object, aliases);
+        }
+        if object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|choice_type| choice_type.trim().eq_ignore_ascii_case("allowed_tools"))
+        {
+            return resolve_allowed_tools_choice(object, aliases);
+        }
+    }
     let mut choice = openai_tool_choice_raw_to_chat(raw);
     rewrite_namespace_tool_choice_names(&mut choice, aliases).then_some(choice)
+}
+
+fn resolve_qualified_tool_choice(
+    object: &Map<String, Value>,
+    aliases: &NamespaceToolAliases,
+) -> Option<Value> {
+    match aliases.resolve_qualified_tool_choice(object)? {
+        QualifiedToolChoiceTarget::Function(provider_name) => Some(json!({
+            "type": "function",
+            "function": { "name": provider_name },
+        })),
+        QualifiedToolChoiceTarget::NativeCustom(provider_name) => Some(json!({
+            "type": "custom",
+            "custom": { "name": provider_name },
+        })),
+    }
+}
+
+fn resolve_allowed_tools_choice(
+    object: &Map<String, Value>,
+    aliases: &NamespaceToolAliases,
+) -> Option<Value> {
+    let (mode, tools) = if object_has_exact_keys(object, &["type", "mode", "tools"]) {
+        (object.get("mode"), object.get("tools"))
+    } else if object_has_exact_keys(object, &["type", "allowed_tools"]) {
+        let allowed = object.get("allowed_tools").and_then(Value::as_object)?;
+        if !object_has_exact_keys(allowed, &["mode", "tools"]) {
+            return None;
+        }
+        (allowed.get("mode"), allowed.get("tools"))
+    } else {
+        return None;
+    };
+    let mode = mode
+        .and_then(Value::as_str)
+        .filter(|mode| matches!(*mode, "auto" | "required"))?;
+    let tools = tools.and_then(Value::as_array)?;
+    let mut resolved_tools = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let tool_object = tool.as_object()?;
+        if tool_object.contains_key("namespace") {
+            resolved_tools.push(resolve_qualified_tool_choice(tool_object, aliases)?);
+        } else {
+            let mut item = openai_tool_choice_raw_to_chat(tool);
+            if !rewrite_namespace_tool_choice_names(&mut item, aliases) {
+                return None;
+            }
+            resolved_tools.push(item);
+        }
+    }
+    Some(json!({
+        "type": "allowed_tools",
+        "allowed_tools": {
+            "mode": mode,
+            "tools": resolved_tools,
+        },
+    }))
 }
 
 pub(crate) fn raw_tool_choice_extension_is_representable_for_openai_chat(
@@ -455,6 +525,13 @@ fn rewrite_custom_choice(choice: &mut Map<String, Value>, aliases: &NamespaceToo
     match aliases.resolve_tool_choice_name(&name) {
         LoweredToolChoiceName::Ambiguous => false,
         LoweredToolChoiceName::Alias(alias) => {
+            if aliases
+                .restore_tool_call(&alias)
+                .custom_text_identity()
+                .is_none()
+            {
+                return false;
+            }
             rewrite_choice_to_function(choice, &alias);
             true
         }
@@ -501,6 +578,13 @@ fn rewrite_named_function_choice(
     match aliases.resolve_tool_choice_name(&name) {
         LoweredToolChoiceName::Unchanged => true,
         LoweredToolChoiceName::Alias(alias) => {
+            if aliases
+                .restore_tool_call(&alias)
+                .custom_text_identity()
+                .is_some()
+            {
+                return false;
+            }
             function.insert("name".to_string(), Value::String(alias));
             true
         }
@@ -607,8 +691,7 @@ fn canonical_request_has_unrepresentable_namespace_tools_for_openai_chat(
             return true;
         }
     } else if let Some(raw) = raw_tool_choice_extension(request) {
-        let mut choice = openai_tool_choice_raw_to_chat(raw);
-        if !rewrite_namespace_tool_choice_names(&mut choice, aliases) {
+        if raw_tool_choice_to_openai_chat_for_request(raw, aliases).is_none() {
             return true;
         }
     }
@@ -616,11 +699,15 @@ fn canonical_request_has_unrepresentable_namespace_tools_for_openai_chat(
     request.messages.iter().any(|message| {
         message.content.iter().any(|block| {
             let CanonicalContentBlock::ToolUse {
-                name, extensions, ..
+                name,
+                input,
+                extensions,
+                ..
             } = block
             else {
                 return false;
             };
+            let is_custom_call = is_openai_custom_tool_call(extensions);
             match namespace_field(extensions) {
                 NamespaceField::Absent => false,
                 NamespaceField::Invalid => true,
@@ -632,6 +719,13 @@ fn canonical_request_has_unrepresentable_namespace_tools_for_openai_chat(
                         || !namespace_tool_use_sidecars_are_chat_representable(
                             extensions, namespace,
                         )
+                        || (normalized.is_some()
+                            && (!aliases.tool_use_matches_declared_kind(
+                                normalized,
+                                name,
+                                is_custom_call,
+                            ) || (aliases.custom_tool_is_function_lowered(normalized, name)
+                                && !input.is_string())))
                 }
             }
         })
@@ -1333,5 +1427,185 @@ mod tests {
         assert!(!namespace_tool_use_sidecars_are_chat_representable(
             &unknown, "reports"
         ));
+    }
+
+    #[test]
+    fn responses_qualified_tool_choice_and_allowed_tools_lower_to_chat() {
+        let body = json!({
+            "model": "gpt-5",
+            "input": [{"role": "user", "content": "patch"}],
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "editing",
+                    "description": "Editing tools",
+                    "tools": [
+                        {"type": "custom", "name": "patch", "description": "Patch file"},
+                        {"type": "function", "name": "read", "parameters": {"type": "object"}}
+                    ]
+                },
+                {
+                    "type": "namespace",
+                    "name": "other",
+                    "description": "Other tools",
+                    "tools": [
+                        {"type": "custom", "name": "patch", "description": "Other patch"}
+                    ]
+                },
+                {"type": "custom", "name": "shell", "description": "Run shell"}
+            ],
+            "tool_choice": {"type": "custom", "namespace": "editing", "name": "patch"}
+        });
+        let chat = crate::formats::registry::convert_request(
+            "openai:responses",
+            "openai:chat",
+            &body,
+            &FormatContext::default(),
+        )
+        .expect("qualified custom tool_choice should lower");
+        assert_eq!(
+            chat["tool_choice"],
+            json!({"type": "function", "function": {"name": "editing__patch"}})
+        );
+
+        let mut allowed_body = body.clone();
+        allowed_body["tool_choice"] = json!({
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [
+                {"type": "custom", "namespace": "editing", "name": "patch"},
+                {"type": "function", "namespace": "editing", "name": "read"},
+                {"type": "custom", "namespace": "functions", "name": "shell"}
+            ]
+        });
+        let allowed_chat = crate::formats::registry::convert_request(
+            "openai:responses",
+            "openai:chat",
+            &allowed_body,
+            &FormatContext::default(),
+        )
+        .expect("qualified allowed_tools should lower");
+        assert_eq!(
+            allowed_chat["tool_choice"],
+            json!({
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "required",
+                    "tools": [
+                        {"type": "function", "function": {"name": "editing__patch"}},
+                        {"type": "function", "function": {"name": "read"}},
+                        {"type": "custom", "custom": {"name": "shell"}}
+                    ]
+                }
+            })
+        );
+
+        let mut mismatched = body;
+        mismatched["tool_choice"] =
+            json!({"type": "function", "namespace": "editing", "name": "patch"});
+        assert!(crate::formats::registry::convert_request(
+            "openai:responses",
+            "openai:chat",
+            &mismatched,
+            &FormatContext::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn responses_qualified_history_rejects_kind_mismatch_and_non_string_custom_input() {
+        let tools = json!([{
+            "type": "namespace",
+            "name": "editing",
+            "description": "Editing tools",
+            "tools": [
+                {"type": "custom", "name": "patch", "description": "Patch file"},
+                {"type": "function", "name": "read", "parameters": {"type": "object"}}
+            ]
+        }]);
+
+        let valid = json!({
+            "model": "gpt-5",
+            "tools": tools,
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "namespace": "editing",
+                "name": "patch",
+                "input": "*** Begin Patch"
+            }]
+        });
+        let chat = crate::formats::registry::convert_request(
+            "openai:responses",
+            "openai:chat",
+            &valid,
+            &FormatContext::default(),
+        )
+        .expect("valid qualified custom_tool_call should lower");
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["name"],
+            "patch"
+        );
+        assert_eq!(
+            chat["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{\"input\":\"*** Begin Patch\"}"
+        );
+
+        let custom_for_function = json!({
+            "model": "gpt-5",
+            "tools": tools,
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "call_read",
+                "namespace": "editing",
+                "name": "read",
+                "input": "raw"
+            }]
+        });
+        assert!(crate::formats::registry::convert_request(
+            "openai:responses",
+            "openai:chat",
+            &custom_for_function,
+            &FormatContext::default(),
+        )
+        .is_err());
+
+        let function_for_custom = json!({
+            "model": "gpt-5",
+            "tools": tools,
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_patch",
+                "namespace": "editing",
+                "name": "patch",
+                "arguments": "{\"input\":\"raw\"}"
+            }]
+        });
+        assert!(crate::formats::registry::convert_request(
+            "openai:responses",
+            "openai:chat",
+            &function_for_custom,
+            &FormatContext::default(),
+        )
+        .is_err());
+
+        let non_string_custom = json!({
+            "model": "gpt-5",
+            "tools": tools,
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "namespace": "editing",
+                "name": "patch",
+                "input": {"nested": true}
+            }]
+        });
+        assert!(crate::formats::registry::convert_request(
+            "openai:responses",
+            "openai:chat",
+            &non_string_custom,
+            &FormatContext::default(),
+        )
+        .is_err());
     }
 }

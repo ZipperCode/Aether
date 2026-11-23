@@ -4,7 +4,7 @@ use crate::{
     formats::{
         context::FormatContext,
         openai::{
-            namespace::{LoweredToolChoiceName, NamespaceToolAliases},
+            namespace::{LoweredToolChoiceName, NamespaceToolAliases, QualifiedToolChoiceTarget},
             shared::{
                 map_openai_reasoning_effort_to_claude_output,
                 map_openai_reasoning_effort_to_thinking_budget,
@@ -357,6 +357,21 @@ fn claude_tool_choice_with_lowering(
     canonical: &CanonicalRequest,
     aliases: &NamespaceToolAliases,
 ) -> Result<Option<Value>, ()> {
+    if let Some(raw) = openai_responses_extension(&canonical.extensions)
+        .and_then(|fields| fields.get("tool_choice"))
+        .and_then(Value::as_object)
+        .filter(|choice| choice.contains_key("namespace"))
+    {
+        let Some(QualifiedToolChoiceTarget::Function(name)) =
+            aliases.resolve_qualified_tool_choice(raw)
+        else {
+            return Err(());
+        };
+        return Ok(canonical_tool_choice_to_claude(
+            Some(&CanonicalToolChoice::Tool { name }),
+            canonical.parallel_tool_calls,
+        ));
+    }
     let Some(mut choice) = canonical_tool_choice_to_claude(
         canonical.tool_choice.as_ref(),
         canonical.parallel_tool_calls,

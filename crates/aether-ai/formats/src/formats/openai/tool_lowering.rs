@@ -164,11 +164,14 @@ pub(crate) fn custom_tool_function_arguments(input: &Value) -> Value {
     json!({ "input": text })
 }
 
-/// Custom text input restored from provider function arguments.
-pub(crate) fn custom_tool_input_from_arguments(arguments: &Value) -> Option<String> {
+/// Namespace tools require a lossless wrapper; flat custom tools also accept legacy provider arguments.
+pub(crate) fn custom_tool_input_from_arguments(
+    arguments: &Value,
+    namespaced: bool,
+) -> Option<String> {
     match arguments {
         Value::String(text) => Some(text.clone()),
-        Value::Object(object) => object
+        Value::Object(object) if !namespaced || object.len() == 1 => object
             .get("input")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
@@ -266,7 +269,7 @@ mod tests {
         let text = custom_tool_function_arguments(&Value::String("*** Begin Patch".to_string()));
         assert_eq!(text, json!({"input": "*** Begin Patch"}));
         assert_eq!(
-            custom_tool_input_from_arguments(&text),
+            custom_tool_input_from_arguments(&text, false),
             Some("*** Begin Patch".to_string())
         );
 
@@ -279,7 +282,7 @@ mod tests {
         let structured = json!({"path": "a.txt", "patch": "x"});
         let arguments = custom_tool_function_arguments(&structured);
         assert_eq!(
-            custom_tool_input_from_arguments(&arguments),
+            custom_tool_input_from_arguments(&arguments, true),
             Some(structured.to_string())
         );
 
@@ -291,12 +294,24 @@ mod tests {
 
     #[test]
     fn custom_text_input_rejects_arguments_without_a_string_input() {
-        assert_eq!(custom_tool_input_from_arguments(&json!({})), None);
+        assert_eq!(custom_tool_input_from_arguments(&json!({}), true), None);
         assert_eq!(
-            custom_tool_input_from_arguments(&json!({"input": {"nested": true}})),
+            custom_tool_input_from_arguments(&json!({"input": {"nested": true}}), true),
             None
         );
-        assert_eq!(custom_tool_input_from_arguments(&json!(3)), None);
+        assert_eq!(
+            custom_tool_input_from_arguments(&json!({"input": "ok", "extra": 1}), true),
+            None
+        );
+        assert_eq!(
+            custom_tool_input_from_arguments(&json!("raw string"), true),
+            Some("raw string".to_string())
+        );
+        assert_eq!(custom_tool_input_from_arguments(&json!(3), true), None);
+        assert_eq!(
+            custom_tool_input_from_arguments(&json!({"input": "ok", "extra": 1}), false).as_deref(),
+            Some("ok")
+        );
     }
 
     #[test]

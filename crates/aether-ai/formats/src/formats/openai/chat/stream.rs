@@ -245,6 +245,9 @@ impl OpenAIChatProviderState {
                 .is_some_and(|data| data.trim_ascii() == b"[DONE]")
             {
                 self.observed_end = true;
+                if required_stream_end("openai:chat", report_context).is_some() {
+                    return self.finish(report_context);
+                }
             }
             return Ok(Vec::new());
         };
@@ -279,6 +282,12 @@ impl OpenAIChatProviderState {
         let Some(chunk_choices) = chunk_object.get("choices").and_then(Value::as_array) else {
             if let Some(usage) = Self::finish_usage(chunk_object.get("usage")) {
                 self.ensure_started(report_context, &mut out);
+                if !self.observed_end
+                    && required_stream_end("openai:chat", report_context).is_some()
+                {
+                    // Keep the usage snapshot; an actual finish_reason may still follow it.
+                    return Ok(out);
+                }
                 let (id, model) = self.identity(report_context);
                 out.push(CanonicalStreamFrame {
                     id,
@@ -300,10 +309,13 @@ impl OpenAIChatProviderState {
             return Ok(out);
         };
         if chunk_choices.is_empty() {
-            if let (Some(finish_reason), Some(usage)) = (
-                self.pending_finish_reason.take(),
-                Self::finish_usage(chunk_object.get("usage")),
-            ) {
+            if let Some((finish_reason, usage)) = Self::finish_usage(chunk_object.get("usage"))
+                .and_then(|usage| {
+                    self.pending_finish_reason
+                        .take()
+                        .map(|reason| (reason, usage))
+                })
+            {
                 self.ensure_started(report_context, &mut out);
                 let (id, model) = self.identity(report_context);
                 out.push(CanonicalStreamFrame {
@@ -572,7 +584,7 @@ impl OpenAIChatProviderState {
             model,
             event: CanonicalStreamEvent::Finish {
                 finish_reason: self.pending_finish_reason.take(),
-                usage: None,
+                usage: self.known_usage.clone(),
             },
         });
         Ok(out)
@@ -2723,6 +2735,20 @@ struct OpenAIResponsesClientToolState {
     restore: Option<ResponsesToolRestore>,
 }
 
+impl OpenAIResponsesClientToolState {
+    fn custom_input(&self, namespaced: bool) -> Option<String> {
+        if !namespaced {
+            return custom_tool_input_from_arguments(
+                &parse_tool_arguments_value(&self.arguments),
+                false,
+            )
+            .or_else(|| Some(self.arguments.clone()));
+        }
+        let arguments = serde_json::from_str::<Value>(&self.arguments).ok()?;
+        custom_tool_input_from_arguments(&arguments, true)
+    }
+}
+
 #[derive(Clone, Default)]
 struct OpenAIResponsesClientToolResultState {
     tool_use_id: String,
@@ -3807,10 +3833,21 @@ impl OpenAIResponsesClientEmitter {
             };
             if let Some(restore) = state.restore.as_ref() {
                 if let Some((namespace, custom_name)) = restore.custom_text_identity() {
-                    let input = custom_tool_input_from_arguments(&parse_tool_arguments_value(
-                        state.arguments.as_str(),
-                    ))
-                    .unwrap_or_else(|| state.arguments.clone());
+                    let input = state.custom_input(namespace.is_some()).ok_or_else(|| {
+                        AiSurfaceFinalizeError::new("custom tool arguments require a string input")
+                    })?;
+                    out.extend(self.encode_response_event(
+                        "response.custom_tool_call_input.delta",
+                        json!({
+                            "type": "response.custom_tool_call_input.delta",
+                            "response_id": self.response_id(),
+                            "output_index": output_index,
+                            "item_id": item_id.clone(),
+                            "call_id": call_id.clone(),
+                            "name": custom_name,
+                            "delta": input,
+                        }),
+                    )?);
                     out.extend(self.encode_response_event(
                         "response.custom_tool_call_input.done",
                         json!({
@@ -4049,10 +4086,10 @@ impl OpenAIResponsesClientEmitter {
                 let item_id = self.tool_call_item_id(*index);
                 if let Some(restore) = state.restore.as_ref() {
                     if let Some((namespace, custom_name)) = restore.custom_text_identity() {
-                        let input = custom_tool_input_from_arguments(&parse_tool_arguments_value(
-                            state.arguments.as_str(),
-                        ))
-                        .unwrap_or_else(|| state.arguments.clone());
+                        // Failure snapshots retain unfinished input, without emitting a tool-done event.
+                        let input = state
+                            .custom_input(namespace.is_some())
+                            .unwrap_or_else(|| state.arguments.clone());
                         let mut item = json!({
                             "type": "custom_tool_call",
                             "id": item_id,
@@ -9838,5 +9875,141 @@ mod tests {
                 },
             })
             .is_err());
+    }
+
+    #[test]
+    fn responses_stream_emits_custom_tool_input_delta_and_rejects_invalid_arguments() {
+        let report_context = json!({
+            "provider_api_format": "openai:chat",
+            "original_request_body": {
+                "tools": [{
+                    "type": "namespace",
+                    "name": "notes",
+                    "description": "Notes tools",
+                    "tools": [{
+                        "type": "custom",
+                        "name": "write",
+                        "description": "Write note"
+                    }]
+                }]
+            }
+        });
+        let mut emitter = OpenAIResponsesClientEmitter::with_report_context(&report_context);
+        let mut bytes = Vec::new();
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_custom_delta".to_string(),
+                    model: "gpt-5".to_string(),
+                    event: CanonicalStreamEvent::ToolCallStart {
+                        index: 0,
+                        call_id: "call_write".to_string(),
+                        name: "write".to_string(),
+                    },
+                })
+                .expect("start"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_custom_delta".to_string(),
+                    model: "gpt-5".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: "{\"input\":\"a\\".to_string(),
+                    },
+                })
+                .expect("delta 1"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_custom_delta".to_string(),
+                    model: "gpt-5".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: "nb \\\"c\\\"\"}".to_string(),
+                    },
+                })
+                .expect("delta 2"),
+        );
+        bytes.extend(
+            emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_custom_delta".to_string(),
+                    model: "gpt-5".to_string(),
+                    event: CanonicalStreamEvent::Finish {
+                        finish_reason: Some("tool_calls".to_string()),
+                        usage: None,
+                    },
+                })
+                .expect("finish"),
+        );
+        let sse = String::from_utf8(bytes).expect("utf8");
+        let delta_pos = sse
+            .find("event: response.custom_tool_call_input.delta")
+            .expect("custom_tool_call_input.delta emitted");
+        let done_pos = sse
+            .find("event: response.custom_tool_call_input.done")
+            .expect("custom_tool_call_input.done emitted");
+        assert!(delta_pos < done_pos, "{sse}");
+        assert!(!sse.contains("response.function_call_arguments."), "{sse}");
+        let events = sse_json_events(&sse);
+        let delta_event = events
+            .iter()
+            .find(|event| event["type"] == "response.custom_tool_call_input.delta")
+            .expect("delta event");
+        assert_eq!(delta_event["delta"], "a\nb \"c\"");
+        let done_event = events
+            .iter()
+            .find(|event| event["type"] == "response.custom_tool_call_input.done")
+            .expect("done event");
+        assert_eq!(done_event["input"], "a\nb \"c\"");
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("completed event");
+        assert_eq!(completed["response"]["output"][0]["namespace"], "notes");
+        assert_eq!(completed["response"]["output"][0]["name"], "write");
+        assert_eq!(completed["response"]["output"][0]["input"], "a\nb \"c\"");
+
+        for bad_arguments in ["{}", "{\"input\":\"ok\",\"extra\":1}", "not json"] {
+            let mut bad_emitter =
+                OpenAIResponsesClientEmitter::with_report_context(&report_context);
+            bad_emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_custom_bad".to_string(),
+                    model: "gpt-5".to_string(),
+                    event: CanonicalStreamEvent::ToolCallStart {
+                        index: 0,
+                        call_id: "call_write".to_string(),
+                        name: "write".to_string(),
+                    },
+                })
+                .expect("start");
+            bad_emitter
+                .emit(CanonicalStreamFrame {
+                    id: "resp_custom_bad".to_string(),
+                    model: "gpt-5".to_string(),
+                    event: CanonicalStreamEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        arguments: bad_arguments.to_string(),
+                    },
+                })
+                .expect("delta");
+            assert!(
+                bad_emitter
+                    .emit(CanonicalStreamFrame {
+                        id: "resp_custom_bad".to_string(),
+                        model: "gpt-5".to_string(),
+                        event: CanonicalStreamEvent::Finish {
+                            finish_reason: Some("tool_calls".to_string()),
+                            usage: None,
+                        },
+                    })
+                    .is_err(),
+                "invalid custom arguments {bad_arguments:?} must fail closed"
+            );
+        }
     }
 }

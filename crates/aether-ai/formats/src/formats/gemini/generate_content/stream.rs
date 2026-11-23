@@ -616,6 +616,7 @@ impl GeminiProviderState {
                 .get("finishReason")
                 .or_else(|| candidate_object.get("finish_reason"))
                 .and_then(Value::as_str)
+                .filter(|reason| !reason.trim().is_empty())
             {
                 // 同事件的其他候选可能还携带本事件的关闭标记：延后到全部候选处理完再终态，
                 // 避免把仍将在同一事件内结束的分片调用误判为截断；校验按候选隔离，

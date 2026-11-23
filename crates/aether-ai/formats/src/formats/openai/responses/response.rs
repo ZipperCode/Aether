@@ -135,6 +135,7 @@ fn canonical_incomplete_reason(canonical: &CanonicalResponse) -> Option<&'static
 pub fn to_raw(canonical: &CanonicalResponse, report_context: &Value, compact: bool) -> Value {
     let namespace_tool_aliases = NamespaceToolAliases::from_report_context(report_context);
     render_to_raw_with_aliases(canonical, report_context, compact, &namespace_tool_aliases)
+        .unwrap_or(Value::Null)
 }
 
 /// 供转换路径使用；carrier 超出审计边界或工具身份上下文不可用时返回 None，由调用方 fail closed。
@@ -148,12 +149,7 @@ pub(crate) fn try_to_raw(
     // 不能借用空清单把 provider 别名当作客户端 Responses 名称输出。
     let namespace_tool_aliases =
         NamespaceToolAliases::try_from_report_context(report_context).ok()?;
-    Some(render_to_raw_with_aliases(
-        canonical,
-        report_context,
-        compact,
-        &namespace_tool_aliases,
-    ))
+    render_to_raw_with_aliases(canonical, report_context, compact, &namespace_tool_aliases)
 }
 
 /// 审计边界：Claude thinking 的签名/redacted 载荷必须非空、限长且非嵌套。
@@ -189,7 +185,7 @@ fn render_to_raw_with_aliases(
     report_context: &Value,
     compact: bool,
     namespace_tool_aliases: &NamespaceToolAliases,
-) -> Value {
+) -> Option<Value> {
     let mut response = Map::new();
     let response_id = canonical.id.replace("chatcmpl", "resp");
     response.insert("id".to_string(), Value::String(response_id.clone()));
@@ -370,8 +366,8 @@ fn render_to_raw_with_aliases(
                     }));
                 } else if let Some((namespace, custom_name)) = restore.custom_text_identity() {
                     // client 自定义文本工具被降级为 function 调用：恢复 custom_tool_call。
-                    let custom_input = custom_tool_input_from_arguments(input)
-                        .unwrap_or_else(|| input.to_string());
+                    let custom_input = custom_tool_input_from_arguments(input, namespace.is_some())
+                        .or_else(|| namespace.is_none().then(|| input.to_string()))?;
                     let mut item = json!({
                         "type": "custom_tool_call",
                         "id": id,
@@ -540,7 +536,7 @@ fn render_to_raw_with_aliases(
             .and_then(openai_responses_timestamp_value)
             .unwrap_or_else(openai_responses_current_timestamp);
         response.insert("created_at".to_string(), Value::from(created_at));
-        return Value::Object(response);
+        return Some(Value::Object(response));
     }
     if let Some(request_object) = report_context
         .get("original_request_body")
@@ -585,7 +581,7 @@ fn render_to_raw_with_aliases(
     legacy_extension_fields.remove("raw_status");
     response.extend(legacy_extension_fields);
     ensure_modern_openai_responses_response_fields(&mut response);
-    Value::Object(response)
+    Some(Value::Object(response))
 }
 
 fn responses_tool_result_item_type(extensions: &BTreeMap<String, Value>) -> Option<&str> {
@@ -1257,5 +1253,87 @@ mod tests {
             ),
             "{raw}"
         );
+    }
+
+    #[test]
+    fn lowered_custom_tool_response_fails_closed_on_invalid_arguments() {
+        let ctx = FormatContext::default().with_report_context(json!({
+            "provider_api_format": "openai:chat",
+            "original_request_body": {
+                "model": "gpt-5",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "editing",
+                    "description": "Editing tools",
+                    "tools": [{
+                        "type": "custom",
+                        "name": "patch",
+                        "description": "Patch file"
+                    }]
+                }]
+            }
+        }));
+        for bad_arguments in ["{}", "{\"input\":\"ok\",\"extra\":1}", "{\"input\":123}"] {
+            let chat_response = json!({
+                "id": "chatcmpl_bad_custom",
+                "object": "chat.completion",
+                "model": "gpt-5",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_patch",
+                            "type": "function",
+                            "function": {
+                                "name": "patch",
+                                "arguments": bad_arguments
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            });
+            assert!(
+                crate::formats::registry::convert_response(
+                    "openai:chat",
+                    "openai:responses",
+                    &chat_response,
+                    &ctx,
+                )
+                .is_err(),
+                "invalid custom arguments {bad_arguments:?} must fail closed"
+            );
+        }
+
+        let raw_string_response = json!({
+            "id": "chatcmpl_raw_custom",
+            "object": "chat.completion",
+            "model": "gpt-5",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_patch",
+                        "type": "function",
+                        "function": {
+                            "name": "patch",
+                            "arguments": "\"raw patch text\""
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let converted = crate::formats::registry::convert_response(
+            "openai:chat",
+            "openai:responses",
+            &raw_string_response,
+            &ctx,
+        )
+        .expect("raw string custom arguments should remain supported");
+        assert_eq!(converted["output"][0]["type"], "custom_tool_call");
+        assert_eq!(converted["output"][0]["input"], "raw patch text");
     }
 }

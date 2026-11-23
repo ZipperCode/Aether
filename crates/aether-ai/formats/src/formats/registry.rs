@@ -14,9 +14,9 @@ use crate::formats::{
 use crate::protocol::canonical::AETHER_AGENT_BRIDGE_PROMPT_CACHE_BREAKPOINT_FIELD;
 use crate::protocol::canonical::{
     audit_gemini_cross_format_response_part, claude_text_citations_to_openai_annotations,
-    gemini_candidate_to_openai_url_annotations, is_claude_thinking_block, CanonicalContentBlock,
-    CanonicalEmbeddingInput, CanonicalRequest, CanonicalResponse, CanonicalStopReason,
-    CanonicalToolChoice,
+    gemini_candidate_to_openai_url_annotations, is_claude_thinking_block,
+    is_openai_custom_tool_call, CanonicalContentBlock, CanonicalEmbeddingInput, CanonicalRequest,
+    CanonicalResponse, CanonicalStopReason, CanonicalToolChoice,
 };
 
 pub use crate::formats::context::{
@@ -2122,7 +2122,8 @@ fn validate_cross_format_request_extensions(
         }
         None => NamespaceToolAliases::from_canonical_tools(&request.tools),
     };
-    let request_extensions = mapped_namespace_request_extensions(source, target, request);
+    let request_extensions =
+        mapped_namespace_request_extensions(source, target, request, &namespace_aliases);
     validate_request_extension_namespace(source, target, "request", &request_extensions)?;
     if target == FormatId::ClaudeMessages {
         if let Some(CanonicalToolChoice::Tool { name }) = request.tool_choice.as_ref() {
@@ -2168,12 +2169,16 @@ fn validate_cross_format_request_extensions(
                     )?;
                 }
                 CanonicalContentBlock::ToolUse {
-                    name, extensions, ..
+                    name,
+                    input,
+                    extensions,
+                    ..
                 } => {
                     let extensions = mapped_namespace_tool_use_extensions(
                         source,
                         target,
                         name,
+                        input,
                         extensions,
                         &namespace_aliases,
                     )?;
@@ -2268,11 +2273,12 @@ fn openai_responses_reasoning_summary_is_droppable(value: &Value) -> bool {
 }
 
 /// 映射请求级 provider 扩展；Responses 跨格式转换可安全删除 include，
-/// Chat 目标额外删除已表达的 tool_choice。
+/// Chat/Claude 只删除目标已能无损表达的 tool_choice。
 fn mapped_namespace_request_extensions(
     source: FormatId,
     target: FormatId,
     request: &CanonicalRequest,
+    aliases: &NamespaceToolAliases,
 ) -> std::collections::BTreeMap<String, Value> {
     let mut mapped = request.extensions.clone();
     if !matches!(
@@ -2302,7 +2308,15 @@ fn mapped_namespace_request_extensions(
                 {
                     fields.remove("include");
                 }
-                if remove_tool_choice {
+                if remove_tool_choice
+                    || (target == FormatId::ClaudeMessages
+                        && fields
+                            .get("tool_choice")
+                            .and_then(Value::as_object)
+                            .is_some_and(|choice| {
+                                aliases.resolve_qualified_tool_choice(choice).is_some()
+                            }))
+                {
                     fields.remove("tool_choice");
                 }
                 fields.is_empty()
@@ -2355,6 +2369,7 @@ fn mapped_namespace_tool_use_extensions(
     source: FormatId,
     target: FormatId,
     name: &str,
+    input: &Value,
     extensions: &std::collections::BTreeMap<String, Value>,
     aliases: &NamespaceToolAliases,
 ) -> Result<std::collections::BTreeMap<String, Value>, FormatError> {
@@ -2369,6 +2384,7 @@ fn mapped_namespace_tool_use_extensions(
     }
 
     let mut mapped = extensions.clone();
+    let mut resolved_namespace: Option<String> = None;
     for provider_namespace in ["openai_responses", "openai_cli"] {
         let Some(provider_fields) = mapped
             .get_mut(provider_namespace)
@@ -2397,6 +2413,9 @@ fn mapped_namespace_tool_use_extensions(
                 if let Err(error) = aliases.tool_use_provider_name(normalized, name) {
                     return Err(tool_lowering_format_error(source, target, error));
                 }
+                if resolved_namespace.is_none() {
+                    resolved_namespace = normalized.map(ToOwned::to_owned);
+                }
                 provider_fields.remove("namespace");
             }
         }
@@ -2411,6 +2430,29 @@ fn mapped_namespace_tool_use_extensions(
             // are reconstructed by the Claude request emitter.
             for key in ["item_type", "execution", "created_by"] {
                 provider_fields.remove(key);
+            }
+        }
+    }
+    if matches!(target, FormatId::OpenAiChat | FormatId::ClaudeMessages) {
+        if let Some(normalized) = resolved_namespace.as_deref() {
+            let is_custom_call = is_openai_custom_tool_call(extensions);
+            if !aliases.tool_use_matches_declared_kind(Some(normalized), name, is_custom_call) {
+                return Err(FormatError::LossyConversionBlocked {
+                    source_format: source.as_str().to_string(),
+                    target_format: target.as_str().to_string(),
+                    field: "messages[].content[].type".to_string(),
+                    reason: "Responses tool call type does not match declared tool kind"
+                        .to_string(),
+                });
+            }
+            if aliases.custom_tool_is_function_lowered(Some(normalized), name) && !input.is_string()
+            {
+                return Err(FormatError::LossyConversionBlocked {
+                    source_format: source.as_str().to_string(),
+                    target_format: target.as_str().to_string(),
+                    field: "messages[].content[].input".to_string(),
+                    reason: "Responses custom tool call requires string input".to_string(),
+                });
             }
         }
     }
@@ -10347,5 +10389,15 @@ mod tests {
         });
 
         assert!(convert_request_pure("openai:responses", "claude:messages", &body).is_err());
+
+        let mut qualified = body;
+        qualified["tool_choice"]["namespace"] = json!("files");
+        qualified["parallel_tool_calls"] = json!(false);
+        let claude =
+            convert_request_pure("openai:responses", "claude:messages", &qualified).unwrap();
+        assert_eq!(
+            claude.value["tool_choice"],
+            json!({"type":"tool", "name":"files__lookup", "disable_parallel_tool_use":true})
+        );
     }
 }

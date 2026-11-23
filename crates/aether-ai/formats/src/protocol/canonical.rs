@@ -6546,6 +6546,7 @@ pub(crate) fn openai_responses_tool_choice_to_canonical(
             "required" => Some(CanonicalToolChoice::Required),
             _ => None,
         },
+        Some(Value::Object(object)) if object.contains_key("namespace") => None,
         Some(Value::Object(object)) => {
             let choice_type = object
                 .get("type")
@@ -6666,10 +6667,13 @@ fn raw_named_tool_choice_to_responses(
     tool_type: &str,
 ) -> Option<Value> {
     let name = raw_tool_choice_name(object, tool_type)?;
-    Some(json!({
-        "type": tool_type,
-        "name": name,
-    }))
+    let mut out = Map::new();
+    out.insert("type".to_string(), Value::String(tool_type.to_string()));
+    if let Some(namespace) = object.get("namespace") {
+        out.insert("namespace".to_string(), namespace.clone());
+    }
+    out.insert("name".to_string(), Value::String(name));
+    Some(Value::Object(out))
 }
 
 fn raw_tool_choice_name(object: &Map<String, Value>, tool_type: &str) -> Option<String> {
@@ -9489,6 +9493,32 @@ mod tests {
         assert_eq!(rebuilt["input"][0]["input"], "ls -la");
         assert_eq!(rebuilt["input"][1]["type"], "custom_tool_call_output");
         assert_eq!(rebuilt["input"][1]["output"], "ok");
+    }
+
+    #[test]
+    fn openai_responses_request_adapter_preserves_qualified_tool_choice_namespace() {
+        let request = json!({
+            "model": "gpt-5",
+            "input": [{"role": "user", "content": "patch"}],
+            "tool_choice": {
+                "type": "custom",
+                "namespace": "editing",
+                "name": "patch"
+            }
+        });
+        let canonical =
+            from_openai_responses_to_canonical_request(&request).expect("canonical request");
+        assert!(canonical.tool_choice.is_none());
+        let rebuilt = canonical_to_openai_responses_request(&canonical, "gpt-5-upstream", false)
+            .expect("openai responses request");
+        assert_eq!(
+            rebuilt["tool_choice"],
+            json!({
+                "type": "custom",
+                "namespace": "editing",
+                "name": "patch"
+            })
+        );
     }
 
     #[test]
