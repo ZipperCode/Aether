@@ -93,7 +93,9 @@ mod tests {
         use serde_json::json;
 
         assert!(!pool_auto_publish_discovered_models_enabled(None));
-        assert!(!pool_auto_publish_discovered_models_enabled(Some(&json!({}))));
+        assert!(!pool_auto_publish_discovered_models_enabled(Some(&json!(
+            {}
+        ))));
         assert!(!pool_auto_publish_discovered_models_enabled(Some(&json!({
             "pool_advanced": {}
         }))));

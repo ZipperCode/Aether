@@ -3,9 +3,8 @@ use std::sync::Arc;
 
 use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, CreateAdminGlobalModelRecord,
-    CreateAdminProviderModelWithBindingsRecord, StoredAdminGlobalModel,
-    StoredAdminGlobalModelPage, StoredAdminProviderModel, StoredModelEndpointBinding,
-    UpsertAdminProviderModelRecord,
+    CreateAdminProviderModelWithBindingsRecord, StoredAdminGlobalModel, StoredAdminGlobalModelPage,
+    StoredAdminProviderModel, StoredModelEndpointBinding, UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogModelFetchCandidate;
 use aether_scheduler_core::{compiled_model_mappings, CompiledModelMappings};
@@ -719,6 +718,8 @@ mod tests {
     };
     use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogModelFetchCandidate;
 
+    type BindingSyncCall = (String, Vec<String>, String, bool, Vec<String>);
+
     #[derive(Default)]
     struct AssociationTestStore {
         global_models: Mutex<Vec<StoredAdminGlobalModel>>,
@@ -726,7 +727,7 @@ mod tests {
         bindings: Mutex<Vec<StoredModelEndpointBinding>>,
         created: Mutex<Vec<CreateAdminProviderModelWithBindingsRecord>>,
         unbound_created: Mutex<Vec<UpsertAdminProviderModelRecord>>,
-        binding_syncs: Mutex<Vec<(String, Vec<String>, String, bool, Vec<String>)>>,
+        binding_syncs: Mutex<Vec<BindingSyncCall>>,
         fail_create_global_error: Option<String>,
     }
 
@@ -769,7 +770,11 @@ mod tests {
                 .lock()
                 .expect("global models mutex")
                 .iter()
-                .filter(|item| query.is_active.is_none_or(|active| item.is_active == active))
+                .filter(|item| {
+                    query
+                        .is_active
+                        .is_none_or(|active| item.is_active == active)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let total = items.len();
@@ -825,10 +830,7 @@ mod tests {
             record: &CreateAdminProviderModelWithBindingsRecord,
         ) -> Result<Option<StoredAdminProviderModel>, Self::Error> {
             {
-                let provider_models = self
-                    .provider_models
-                    .lock()
-                    .expect("provider models mutex");
+                let provider_models = self.provider_models.lock().expect("provider models mutex");
                 if provider_models.iter().any(|item| {
                     item.provider_id == record.model.provider_id
                         && item.provider_model_name == record.model.provider_model_name
@@ -1128,7 +1130,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_discovered_global_models_requires_endpoint_evidence_and_preserves_disabled_aliases() {
+    async fn ensure_discovered_global_models_requires_endpoint_evidence_and_preserves_disabled_aliases(
+    ) {
         let disabled_global = StoredAdminGlobalModel::new(
             "global-disabled".to_string(),
             "disabled-global-model".to_string(),

@@ -1289,7 +1289,7 @@ async fn gateway_records_gemini_stream_usage_and_pricing_with_cache_read_tokens_
         cache_read_tokens: 30,
     };
     let stream_body =
-        ["data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n\n"];
+        ["data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}]}\n\n"];
     let frames = build_stream_frames(
         &stream_body,
         standardized_usage_json(expected),
@@ -1339,7 +1339,7 @@ async fn gateway_records_gemini_stream_usage_and_pricing_with_cache_read_tokens_
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.text().await.expect("stream body should read"),
-        "[{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}]"
+        "[{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}]}]"
     );
 
     let stored_usage = wait_for_usage_status(

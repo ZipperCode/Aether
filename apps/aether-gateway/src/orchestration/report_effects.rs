@@ -677,7 +677,8 @@ async fn apply_local_stream_report_effect(state: &AppState, payload: &GatewayStr
                     "gateway failed to persist codex realtime quota from stream response headers"
                 );
             }
-        } else if is_actual_upstream_http_429(payload.status_code, payload.report_context.as_ref()) {
+        } else if is_actual_upstream_http_429(payload.status_code, payload.report_context.as_ref())
+        {
             if let Err(err) = sync_codex_quota_from_429_response_headers(
                 state,
                 payload.status_code,
@@ -1550,7 +1551,10 @@ mod tests {
         let headers = BTreeMap::from([
             ("x-codex-plan-type".to_string(), "pro".to_string()),
             ("x-codex-active-limit".to_string(), "bengalfox".to_string()),
-            ("x-codex-primary-used-percent".to_string(), "100".to_string()),
+            (
+                "x-codex-primary-used-percent".to_string(),
+                "100".to_string(),
+            ),
             (
                 "x-codex-primary-reset-at".to_string(),
                 "2000000000".to_string(),

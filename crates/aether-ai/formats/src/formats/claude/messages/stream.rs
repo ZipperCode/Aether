@@ -352,10 +352,10 @@ impl ClaudeProviderState {
                 let Some(delta) = event_object.get("delta").and_then(Value::as_object) else {
                     return Ok(out);
                 };
-                if !delta
+                if delta
                     .get("stop_reason")
                     .and_then(Value::as_str)
-                    .is_some_and(|reason| !reason.is_empty())
+                    .is_none_or(str::is_empty)
                 {
                     self.merge_usage(canonical_usage_from_claude_usage(event_object.get("usage")));
                     return Ok(out);

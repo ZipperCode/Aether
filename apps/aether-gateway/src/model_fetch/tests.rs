@@ -1419,7 +1419,8 @@ async fn codex_model_discovery_fetches_account_specific_oauth_catalogs() {
     );
 }
 #[tokio::test]
-async fn auto_publish_discovered_models_publishes_filtered_discovered_ids_and_keeps_flag_off_behavior() {
+async fn auto_publish_discovered_models_publishes_filtered_discovered_ids_and_keeps_flag_off_behavior(
+) {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(|| async {
@@ -1462,10 +1463,8 @@ async fn auto_publish_discovered_models_publishes_filtered_discovered_ids_and_ke
         ],
     ));
     let global_model_repository = Arc::new(
-        InMemoryGlobalModelReadRepository::seed(Vec::new()).with_endpoint_provider_ids([
-            ("ep-off", "provider-off"),
-            ("ep-on", "provider-on"),
-        ]),
+        InMemoryGlobalModelReadRepository::seed(Vec::new())
+            .with_endpoint_provider_ids([("ep-off", "provider-off"), ("ep-on", "provider-on")]),
     );
     let data_state = crate::data::GatewayDataState::disabled()
         .attach_provider_catalog_repository_for_tests(Arc::clone(&provider_catalog_repository))
@@ -1613,7 +1612,13 @@ async fn auto_publish_discovered_models_respects_per_account_gates() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider, preset_provider],
         vec![ep_chat, ep_resp],
-        vec![key_inactive, key_no_autofetch, key_failed, key_active, key_preset],
+        vec![
+            key_inactive,
+            key_no_autofetch,
+            key_failed,
+            key_active,
+            key_preset,
+        ],
     ));
     let global_model_repository = Arc::new(
         InMemoryGlobalModelReadRepository::seed(Vec::new()).with_endpoint_provider_ids([
@@ -1711,7 +1716,11 @@ async fn auto_publish_discovered_models_respects_disabled_records_aliases_and_ad
     }));
     let mut ep_chat = sample_endpoint("provider-respect", "ep-chat", "https://api.openai.example");
     ep_chat.api_format = "openai:chat".to_string();
-    let mut ep_claude = sample_endpoint("provider-respect", "ep-claude", "https://api.openai.example");
+    let mut ep_claude = sample_endpoint(
+        "provider-respect",
+        "ep-claude",
+        "https://api.openai.example",
+    );
     ep_claude.api_format = "claude:messages".to_string();
 
     let mut key = sample_key("provider-respect", "key-respect");
@@ -1720,11 +1729,8 @@ async fn auto_publish_discovered_models_respects_disabled_records_aliases_and_ad
     key.model_include_patterns = None;
     key.model_exclude_patterns = None;
 
-    let mut disabled_global = sample_global_model(
-        "gm-disabled",
-        "disabled-global",
-        &["disabled-alias-.*"],
-    );
+    let mut disabled_global =
+        sample_global_model("gm-disabled", "disabled-global", &["disabled-alias-.*"]);
     disabled_global.is_active = false;
 
     let mut existing_global = sample_global_model("gm-existing", "existing-global", &[]);
@@ -1910,7 +1916,9 @@ async fn auto_publish_discovered_models_skips_supplemented_codex_image_models() 
         ),
     ];
     let key = codex_oauth_sample_key(
-        "key-codex-paid", "provider-codex-autopublish", &["openai:responses", "openai:image"],
+        "key-codex-paid",
+        "provider-codex-autopublish",
+        &["openai:responses", "openai:image"],
         "synthetic-codex-oauth-paid",
         json!({"provider_type":"codex","account_id":"acct-codex-paid","plan_type":"plus","expires_at":4_102_444_800u64}),
     );

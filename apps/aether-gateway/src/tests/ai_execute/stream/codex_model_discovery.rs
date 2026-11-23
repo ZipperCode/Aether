@@ -1062,14 +1062,16 @@ impl FixtureBuilder {
             pool_enabled: self.pool_enabled,
             model_specs: model_specs
                 .iter()
-                .map(|(model_id, global_model_id, global_name, provider_model_name)| {
-                    (
-                        model_id.clone(),
-                        global_model_id.clone(),
-                        (*global_name).to_string(),
-                        (*provider_model_name).to_string(),
-                    )
-                })
+                .map(
+                    |(model_id, global_model_id, global_name, provider_model_name)| {
+                        (
+                            model_id.clone(),
+                            global_model_id.clone(),
+                            (*global_name).to_string(),
+                            (*provider_model_name).to_string(),
+                        )
+                    },
+                )
                 .collect(),
             provider_catalog_repository: Arc::clone(&provider_catalog_repository),
         });
@@ -1092,10 +1094,12 @@ impl FixtureBuilder {
                 ..Default::default()
             });
         if let Some(token_url) = self.oauth_token_url {
-            gateway_state = gateway_state.with_provider_oauth_token_url_for_tests("codex", token_url);
+            gateway_state =
+                gateway_state.with_provider_oauth_token_url_for_tests("codex", token_url);
         }
         for (nonce, payload) in self.oauth_state_entries {
-            gateway_state = gateway_state.with_provider_oauth_state_entry_for_tests(&nonce, payload);
+            gateway_state =
+                gateway_state.with_provider_oauth_state_entry_for_tests(&nonce, payload);
         }
         if let Some(execution_runtime_url) = self.execution_runtime_url {
             gateway_state =
@@ -1253,17 +1257,17 @@ impl DynamicCodexCandidateSelectionRepository {
         let mut rows = Vec::new();
         for (model_id, global_model_id, global_name, provider_model_name) in &self.model_specs {
             for key in &keys {
-                let allowed_models = key
-                    .allowed_models
-                    .as_ref()
-                    .and_then(Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect::<Vec<_>>()
-                    });
+                let allowed_models =
+                    key.allowed_models
+                        .as_ref()
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(ToOwned::to_owned)
+                                .collect::<Vec<_>>()
+                        });
                 let account = AccountSeedSpec {
                     key_id: key.id.clone(),
                     key_name: key.name.clone(),
@@ -2567,7 +2571,8 @@ async fn codex_model_discovery_versioned_models_bootstrap_succeeds_without_writi
 fn codex_model_discovery_versioned_models_opt_in_pool_schedules_managed_fetch_and_serves() {
     run_async_test_on_large_stack(
         "codex_model_discovery_versioned_models_opt_in_pool_schedules_managed_fetch_and_serves",
-        codex_model_discovery_versioned_models_opt_in_pool_schedules_managed_fetch_and_serves_impl(),
+        codex_model_discovery_versioned_models_opt_in_pool_schedules_managed_fetch_and_serves_impl(
+        ),
     );
 }
 
@@ -2693,93 +2698,96 @@ async fn start_slow_quota_execution_runtime_server(
     let router = Router::new()
         .route(
             "/v1/execute/sync",
-        any(move |request: Request| {
-            let hits_inner = Arc::clone(&hits_clone);
-            let client = forward_client.clone();
-            async move {
-                let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
-                    &to_bytes(request.into_body(), usize::MAX)
-                        .await
-                        .expect("execution plan body should read"),
-                )
-                .expect("execution plan should parse");
-                let is_quota_url = matches!(
-                    plan.url.as_str(),
-                    "https://chatgpt.com/backend-api/wham/usage"
-                        | "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-                );
-                if is_quota_url {
-                    hits_inner.fetch_add(1, Ordering::SeqCst);
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
-                    let body_json = match plan.url.as_str() {
-                        "https://chatgpt.com/backend-api/wham/usage" => json!({
-                            "plan_type": "plus",
-                            "rate_limit": {
-                                "primary_window": {
-                                    "used_percent": 12.0,
-                                    "reset_at": 1_900_000_000u64,
-                                    "window_minutes": 300
+            any(move |request: Request| {
+                let hits_inner = Arc::clone(&hits_clone);
+                let client = forward_client.clone();
+                async move {
+                    let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                        &to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .expect("execution plan body should read"),
+                    )
+                    .expect("execution plan should parse");
+                    let is_quota_url = matches!(
+                        plan.url.as_str(),
+                        "https://chatgpt.com/backend-api/wham/usage"
+                            | "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+                    );
+                    if is_quota_url {
+                        hits_inner.fetch_add(1, Ordering::SeqCst);
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let body_json = match plan.url.as_str() {
+                            "https://chatgpt.com/backend-api/wham/usage" => json!({
+                                "plan_type": "plus",
+                                "rate_limit": {
+                                    "primary_window": {
+                                        "used_percent": 12.0,
+                                        "reset_at": 1_900_000_000u64,
+                                        "window_minutes": 300
+                                    }
                                 }
-                            }
-                        }),
-                        _ => json!({"available_count": 0, "credits": []}),
+                            }),
+                            _ => json!({"available_count": 0, "credits": []}),
+                        };
+                        return Json(aether_contracts::ExecutionResult {
+                            request_id: plan.request_id,
+                            candidate_id: None,
+                            status_code: 200,
+                            headers: std::collections::BTreeMap::new(),
+                            response_observation: None,
+                            body: Some(aether_contracts::ResponseBody {
+                                json_body: Some(body_json),
+                                body_bytes_b64: None,
+                            }),
+                            telemetry: None,
+                            error: None,
+                        });
+                    }
+
+                    let method = reqwest::Method::from_bytes(plan.method.as_bytes())
+                        .expect("execution plan method should parse");
+                    let mut req = client.request(method, &plan.url);
+                    for (name, value) in &plan.headers {
+                        req = req.header(name, value);
+                    }
+                    let resp = req
+                        .send()
+                        .await
+                        .expect("forwarded execution plan request should succeed");
+                    let status_code = resp.status().as_u16();
+                    let mut headers = std::collections::BTreeMap::new();
+                    for (name, value) in resp.headers() {
+                        if let Ok(text) = value.to_str() {
+                            headers.insert(name.as_str().to_string(), text.to_string());
+                        }
+                    }
+                    let bytes = resp
+                        .bytes()
+                        .await
+                        .expect("forwarded response body should read");
+                    let json_body = serde_json::from_slice::<Value>(&bytes).ok();
+                    let body_bytes_b64 = if json_body.is_none() && !bytes.is_empty() {
+                        Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
+                    } else {
+                        None
                     };
-                    return Json(aether_contracts::ExecutionResult {
+                    Json(aether_contracts::ExecutionResult {
                         request_id: plan.request_id,
                         candidate_id: None,
-                        status_code: 200,
-                        headers: std::collections::BTreeMap::new(),
+                        status_code,
+                        headers,
                         response_observation: None,
                         body: Some(aether_contracts::ResponseBody {
-                            json_body: Some(body_json),
-                            body_bytes_b64: None,
+                            json_body,
+                            body_bytes_b64,
                         }),
                         telemetry: None,
                         error: None,
-                    });
+                    })
                 }
-
-                let method = reqwest::Method::from_bytes(plan.method.as_bytes())
-                    .expect("execution plan method should parse");
-                let mut req = client.request(method, &plan.url);
-                for (name, value) in &plan.headers {
-                    req = req.header(name, value);
-                }
-                let resp = req
-                    .send()
-                    .await
-                    .expect("forwarded execution plan request should succeed");
-                let status_code = resp.status().as_u16();
-                let mut headers = std::collections::BTreeMap::new();
-                for (name, value) in resp.headers() {
-                    if let Ok(text) = value.to_str() {
-                        headers.insert(name.as_str().to_string(), text.to_string());
-                    }
-                }
-                let bytes = resp.bytes().await.expect("forwarded response body should read");
-                let json_body = serde_json::from_slice::<Value>(&bytes).ok();
-                let body_bytes_b64 = if json_body.is_none() && !bytes.is_empty() {
-                    Some(base64::engine::general_purpose::STANDARD.encode(&bytes))
-                } else {
-                    None
-                };
-                Json(aether_contracts::ExecutionResult {
-                    request_id: plan.request_id,
-                    candidate_id: None,
-                    status_code,
-                    headers,
-                    response_observation: None,
-                    body: Some(aether_contracts::ResponseBody {
-                        json_body,
-                        body_bytes_b64,
-                    }),
-                    telemetry: None,
-                    error: None,
-                })
-            }
-        }),
+            }),
         )
         .route(
             "/v1/execute/stream",
@@ -2966,7 +2974,8 @@ fn codex_model_discovery_web_oauth_new_account_auto_fetches_and_serves_without_r
     );
 }
 
-async fn codex_model_discovery_web_oauth_new_account_auto_fetches_and_serves_without_restart_impl() {
+async fn codex_model_discovery_web_oauth_new_account_auto_fetches_and_serves_without_restart_impl()
+{
     let (token_url, token_handle) = start_codex_oauth_token_server(
         PAID_OAUTH_TOKEN,
         "paid-web-refresh-token",
@@ -3013,7 +3022,11 @@ async fn codex_model_discovery_web_oauth_new_account_auto_fetches_and_serves_wit
             }),
         )
         .await;
-    assert_eq!(before_status, StatusCode::SERVICE_UNAVAILABLE, "{before_body}");
+    assert_eq!(
+        before_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{before_body}"
+    );
     assert_eq!(harness.counts().total_gen, 0);
 
     let response = harness
@@ -3119,7 +3132,10 @@ async fn codex_model_discovery_single_import_new_account_auto_fetches_and_serves
         .await
         .expect("single import request should succeed");
     assert_eq!(response.status(), StatusCode::OK);
-    let payload: Value = response.json().await.expect("single import JSON should parse");
+    let payload: Value = response
+        .json()
+        .await
+        .expect("single import JSON should parse");
     assert_eq!(payload["replaced"], false, "payload={payload}");
     let new_key_id = payload["key_id"]
         .as_str()
@@ -3140,7 +3156,8 @@ async fn codex_model_discovery_single_import_new_account_auto_fetches_and_serves
 fn codex_model_discovery_batch_import_new_account_auto_fetches_and_serves_without_restart() {
     run_async_test_on_large_stack(
         "codex_model_discovery_batch_import_new_account_auto_fetches_and_serves_without_restart",
-        codex_model_discovery_batch_import_new_account_auto_fetches_and_serves_without_restart_impl(),
+        codex_model_discovery_batch_import_new_account_auto_fetches_and_serves_without_restart_impl(
+        ),
     );
 }
 
@@ -3185,9 +3202,15 @@ async fn codex_model_discovery_batch_import_new_account_auto_fetches_and_serves_
         .await
         .expect("batch import request should succeed");
     assert_eq!(response.status(), StatusCode::OK);
-    let payload: Value = response.json().await.expect("batch import JSON should parse");
+    let payload: Value = response
+        .json()
+        .await
+        .expect("batch import JSON should parse");
     assert_eq!(payload["success"], 1, "payload={payload}");
-    assert_eq!(payload["results"][0]["replaced"], false, "payload={payload}");
+    assert_eq!(
+        payload["results"][0]["replaced"], false,
+        "payload={payload}"
+    );
     let new_key_id = payload["results"][0]["key_id"]
         .as_str()
         .expect("key_id should exist")
@@ -3336,7 +3359,10 @@ async fn codex_model_discovery_post_create_fetch_failure_records_error_and_denie
         .await
         .expect("single import request should succeed");
     assert_eq!(response.status(), StatusCode::OK);
-    let payload: Value = response.json().await.expect("single import JSON should parse");
+    let payload: Value = response
+        .json()
+        .await
+        .expect("single import JSON should parse");
     let new_key_id = payload["key_id"]
         .as_str()
         .expect("key_id should exist")

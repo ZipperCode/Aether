@@ -347,6 +347,26 @@ fn codex_quota_execution_result(request_id: &str) -> serde_json::Value {
     })
 }
 
+fn codex_model_fetch_execution_result(request_id: &str) -> serde_json::Value {
+    json!({
+        "request_id": request_id,
+        "status_code": 200,
+        "headers": {
+            "content-type": "application/json"
+        },
+        "body": {
+            "json_body": {
+                "models": [
+                    {
+                        "id": "gpt-5",
+                        "slug": "gpt-5"
+                    }
+                ]
+            }
+        }
+    })
+}
+
 fn windsurf_register_user_execution_result(request_id: &str) -> serde_json::Value {
     json!({
         "request_id": request_id,
@@ -384,6 +404,7 @@ fn assert_single_provider_oauth_refresh_token_plan<'a>(
         plans.iter().all(|plan| {
             plan.request_id == "provider-oauth:refresh-token"
                 || plan.request_id.starts_with("codex-quota:")
+                || plan.request_id.starts_with("req-model-fetch-")
         }),
         "unexpected execution plans: {:?}",
         plans
@@ -5485,11 +5506,13 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtim
                 let proxy = plan.proxy.as_ref().expect("proxy snapshot should exist");
                 assert_eq!(proxy.node_id.as_deref(), Some("proxy-node-codex-import"));
                 let timeouts = plan.timeouts.as_ref().expect("timeouts should exist");
-                assert_eq!(timeouts.connect_ms, Some(60_000));
-                assert_eq!(timeouts.read_ms, Some(60_000));
-                assert_eq!(timeouts.write_ms, Some(60_000));
-                assert_eq!(timeouts.pool_ms, Some(60_000));
-                assert_eq!(timeouts.total_ms, Some(60_000));
+                if !plan.request_id.starts_with("req-model-fetch-") {
+                    assert_eq!(timeouts.connect_ms, Some(60_000));
+                    assert_eq!(timeouts.read_ms, Some(60_000));
+                    assert_eq!(timeouts.write_ms, Some(60_000));
+                    assert_eq!(timeouts.pool_ms, Some(60_000));
+                    assert_eq!(timeouts.total_ms, Some(60_000));
+                }
                 if plan.request_id == "provider-oauth:refresh-token" {
                     assert_eq!(plan.method, "POST");
                     assert_eq!(plan.url, "https://oauth.example/oauth/token");
@@ -5504,13 +5527,16 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtim
                         Some("true")
                     );
                     Json(codex_import_token_execution_result(&plan.request_id))
+                } else if plan.request_id.starts_with("codex-quota:") {
+                    Json(codex_quota_execution_result(&plan.request_id))
                 } else {
                     assert!(
-                        plan.request_id.starts_with("codex-quota:"),
+                        plan.request_id.starts_with("req-model-fetch-"),
                         "unexpected execution plan: {}",
                         plan.request_id
                     );
-                    Json(codex_quota_execution_result(&plan.request_id))
+                    assert_eq!(timeouts.first_byte_ms, Some(30_000));
+                    Json(codex_model_fetch_execution_result(&plan.request_id))
                 }
             }
         }),
@@ -5626,13 +5652,15 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtim
                 assert_eq!(proxy.node_id.as_deref(), Some("proxy-node-codex-provider"));
                 if plan.request_id == "provider-oauth:refresh-token" {
                     Json(codex_import_token_execution_result(&plan.request_id))
+                } else if plan.request_id.starts_with("codex-quota:") {
+                    Json(codex_quota_execution_result(&plan.request_id))
                 } else {
                     assert!(
-                        plan.request_id.starts_with("codex-quota:"),
+                        plan.request_id.starts_with("req-model-fetch-"),
                         "unexpected execution plan: {}",
                         plan.request_id
                     );
-                    Json(codex_quota_execution_result(&plan.request_id))
+                    Json(codex_model_fetch_execution_result(&plan.request_id))
                 }
             }
         }),
@@ -5754,13 +5782,15 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtim
                 assert_eq!(proxy.node_id.as_deref(), Some("proxy-node-codex-system"));
                 if plan.request_id == "provider-oauth:refresh-token" {
                     Json(codex_import_token_execution_result(&plan.request_id))
+                } else if plan.request_id.starts_with("codex-quota:") {
+                    Json(codex_quota_execution_result(&plan.request_id))
                 } else {
                     assert!(
-                        plan.request_id.starts_with("codex-quota:"),
+                        plan.request_id.starts_with("req-model-fetch-"),
                         "unexpected execution plan: {}",
                         plan.request_id
                     );
-                    Json(codex_quota_execution_result(&plan.request_id))
+                    Json(codex_model_fetch_execution_result(&plan.request_id))
                 }
             }
         }),

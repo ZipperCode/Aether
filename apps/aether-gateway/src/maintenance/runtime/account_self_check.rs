@@ -24,8 +24,8 @@ use crate::handlers::shared::provider_pool::{
 };
 use crate::{AppState, GatewayError};
 
-use crate::ai_serving::provider_key_pool_score_scope;
 use super::{shared_auth_maintenance_gate, AuthMaintenanceGate};
+use crate::ai_serving::provider_key_pool_score_scope;
 
 const ACCOUNT_SELF_CHECK_REDIS_PREFIX: &str = "ap:account_self_check:last";
 const ACCOUNT_SELF_CHECK_LOCK_TTL_MS: u64 = 30_000;
@@ -1589,10 +1589,15 @@ mod tests {
             &provider("codex", Some(json!({"pool_advanced": {}}))),
             "codex",
         )
-        .expect("codex pool should enable runtime quota revisit even when routine self-check is off");
+        .expect(
+            "codex pool should enable runtime quota revisit even when routine self-check is off",
+        );
         assert!(!codex_pool.routine_enabled);
         assert!(codex_pool.revisit_runtime_quota_exhausted);
-        assert_eq!(codex_pool.pool_config.account_self_check_interval_minutes, 60);
+        assert_eq!(
+            codex_pool.pool_config.account_self_check_interval_minutes,
+            60
+        );
 
         let antigravity_pool = account_self_check_plan_for_provider(
             &provider(
@@ -1617,7 +1622,10 @@ mod tests {
                 .account_self_check_interval_minutes,
             30
         );
-        assert_eq!(antigravity_pool.pool_config.account_self_check_concurrency, 2);
+        assert_eq!(
+            antigravity_pool.pool_config.account_self_check_concurrency,
+            2
+        );
 
         assert!(account_self_check_plan_for_provider(&provider("codex", None), "codex").is_none());
         assert!(account_self_check_plan_for_provider(
@@ -1677,7 +1685,9 @@ mod tests {
                 }
             })),
         );
-        assert!(!is_runtime_quota_exhausted_revisit_key(&manual_no_fingerprint));
+        assert!(!is_runtime_quota_exhausted_revisit_key(
+            &manual_no_fingerprint
+        ));
 
         let manual_source = sample_pool_key(
             "provider-codex",
@@ -1722,7 +1732,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn perform_account_self_check_once_revisits_only_active_runtime_quota_exhausted_codex_and_antigravity_pool_keys_when_routine_off() {
+    async fn perform_account_self_check_once_revisits_only_active_runtime_quota_exhausted_codex_and_antigravity_pool_keys_when_routine_off(
+    ) {
         let seen_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
         let seen_plans_clone = Arc::clone(&seen_plans);
         let execution_runtime = Router::new().route(
@@ -2064,7 +2075,10 @@ mod tests {
         assert!(plans
             .iter()
             .any(|plan| plan.url.contains("fetchAvailableModels")));
-        let urls = plans.iter().map(|plan| plan.url.as_str()).collect::<Vec<_>>();
+        let urls = plans
+            .iter()
+            .map(|plan| plan.url.as_str())
+            .collect::<Vec<_>>();
         assert!(
             plans.iter().all(|plan| {
                 plan.url.contains("wham/usage")
