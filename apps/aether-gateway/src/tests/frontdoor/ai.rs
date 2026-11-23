@@ -1289,7 +1289,9 @@ async fn run_versioned_codex_model_cards_frontdoor_scenario() {
     assert_eq!(catalog_hits.load(Ordering::SeqCst), 1);
 
     let restricted_response = client
-        .get(format!("{gateway_url}/v1/models?client_version=0.145.2"))
+        .get(format!(
+            "{gateway_url}/codex/models/?client_version=0.145.2"
+        ))
         .header("authorization", "Bearer sk-codex-legacy-only")
         .send()
         .await
@@ -1307,6 +1309,13 @@ async fn run_versioned_codex_model_cards_frontdoor_scenario() {
         Some(vec!["legacy-alias"])
     );
     assert_eq!(catalog_hits.load(Ordering::SeqCst), 1);
+
+    let anonymous = client
+        .get(format!("{gateway_url}/codex/models"))
+        .send()
+        .await
+        .expect("anonymous Codex catalog request should complete");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
     let incomplete_authorized_response = client
         .get(format!("{gateway_url}/v1/models?client_version=0.145.2"))

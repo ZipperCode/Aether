@@ -203,6 +203,19 @@ async fn gateway_serves_frontend_routes_and_assets_without_shadowing_public_api(
     assert_eq!(payload["site_name"], "Aether");
     assert_eq!(payload["site_subtitle"], "AI Gateway");
 
+    for path in ["/codex/models", "/codex/models/"] {
+        let response = client
+            .get(format!("{gateway_url}{path}"))
+            .header("accept", "text/html")
+            .send()
+            .await
+            .expect("catalog request should bypass the static frontend");
+        let _: serde_json::Value = response
+            .json()
+            .await
+            .expect("expected API JSON, not SPA HTML");
+    }
+
     let response = client
         .get(format!("{gateway_url}/install/4b143b471afa4d9ebc652d95"))
         .send()
