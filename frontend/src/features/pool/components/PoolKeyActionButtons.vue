@@ -10,7 +10,21 @@
       :class="layout === 'mobile' ? 'min-w-0 flex-1' : ''"
     >
       <Button
-        v-if="actionId === 'copy_or_download' && canExportOAuthCredential(poolKey)"
+        v-if="actionId === 'model_test'"
+        variant="ghost"
+        size="icon"
+        class="h-7 w-7 shrink-0 transition-colors"
+        :class="modelTestExpanded ? 'bg-primary/10 text-primary hover:bg-primary/15 hover:text-primary' : 'text-muted-foreground hover:text-foreground'"
+        :title="modelTestExpanded ? t('pool.actions.collapseModelTest') : t('pool.actions.modelTest')"
+        :aria-label="modelTestExpanded ? t('pool.actions.collapseModelTest') : t('pool.actions.modelTest')"
+        :aria-expanded="modelTestExpanded"
+        :data-testid="`pool-model-test-toggle-${layout}-${poolKey.key_id}`"
+        @click.stop="$emit('toggleModelTest')"
+      >
+        <FlaskConical class="w-3.5 h-3.5" />
+      </Button>
+      <Button
+        v-else-if="actionId === 'copy_or_download' && canExportOAuthCredential(poolKey)"
         variant="ghost"
         size="icon"
         class="h-7 w-7 shrink-0"
@@ -160,7 +174,7 @@
 <script setup lang="ts">
 import { useI18n } from '@/i18n'
 
-import { Copy, Download, Power, RefreshCw, RotateCcw, Shield, SquarePen, Trash2 } from 'lucide-vue-next'
+import { Copy, Download, FlaskConical, Power, RefreshCw, RotateCcw, Shield, SquarePen, Trash2 } from 'lucide-vue-next'
 import { Button } from '@/components/ui'
 import type { PoolKeyDetail } from '@/api/endpoints/pool'
 import { canExportOAuthCredential } from '@/features/providers/utils/providerKeyAuth'
@@ -178,6 +192,7 @@ withDefaults(defineProps<{
   poolKey: PoolKeyDetail
   layout: 'desktop' | 'mobile'
   actionIds: PoolKeyActionId[]
+  modelTestExpanded?: boolean
   canRefreshToken?: boolean
   refreshButtonTitle?: string
   refreshingOauth?: boolean
@@ -192,6 +207,7 @@ withDefaults(defineProps<{
   proxyPopoverOpen?: boolean
 }>(), {
   canRefreshToken: false,
+  modelTestExpanded: false,
   refreshButtonTitle: '',
   refreshingOauth: false,
   resettingCycle: false,
@@ -206,6 +222,7 @@ withDefaults(defineProps<{
 })
 
 defineEmits<{
+  toggleModelTest: []
   download: []
   copy: []
   refreshOauth: []

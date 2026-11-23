@@ -1069,6 +1069,7 @@ async fn provider_query_read_test_transport(
             // Explicit admin tests bypass scheduling status only in this local snapshot.
             transport.provider.is_active = true;
             transport.endpoint.is_active = true;
+            transport.key.is_active = true;
         }
     }
     Ok(transport)
@@ -1106,8 +1107,7 @@ async fn provider_query_select_preferred_non_kiro_endpoint(
                 continue;
             }
             for key in keys {
-                if !key.is_active
-                    || !provider_query_selected_key_ids_allow_key(selected_key_ids, &key.id)
+                if !provider_query_key_eligible_for_test(key, selected_key_ids)
                     || !provider_query_key_supports_endpoint(
                         key,
                         &provider.provider_type,
@@ -1143,8 +1143,7 @@ async fn provider_query_select_preferred_non_kiro_endpoint(
         .find(|endpoint| {
             (selected_key_ids.is_some() || endpoint.is_active)
                 && keys.iter().any(|key| {
-                    key.is_active
-                        && provider_query_selected_key_ids_allow_key(selected_key_ids, &key.id)
+                    provider_query_key_eligible_for_test(key, selected_key_ids)
                         && provider_query_key_supports_endpoint(
                             key,
                             &provider.provider_type,
@@ -1160,11 +1159,15 @@ async fn provider_query_select_preferred_non_kiro_endpoint(
         .cloned()
 }
 
-fn provider_query_selected_key_ids_allow_key(
+/// 管理端测试校验 Key 是否允许进入候选：显式指定 Key ID 时放行已停用账号，未指定时仅包含启用账号。
+fn provider_query_key_eligible_for_test(
+    key: &StoredProviderCatalogKey,
     selected_key_ids: Option<&BTreeSet<String>>,
-    key_id: &str,
 ) -> bool {
-    selected_key_ids.is_none_or(|ids| ids.contains(key_id))
+    match selected_key_ids {
+        Some(ids) => ids.contains(&key.id),
+        None => key.is_active,
+    }
 }
 
 fn provider_query_selected_key_ids_all_exist(
@@ -1696,8 +1699,7 @@ async fn provider_query_build_kiro_test_candidates(
 
     for key in all_keys
         .into_iter()
-        .filter(|key| key.is_active)
-        .filter(|key| provider_query_selected_key_ids_allow_key(selected_key_ids.as_ref(), &key.id))
+        .filter(|key| provider_query_key_eligible_for_test(key, selected_key_ids.as_ref()))
         .filter(|key| {
             provider_query_key_supports_endpoint(key, &provider.provider_type, &endpoint.api_format)
         })

@@ -204,12 +204,14 @@
               </TableRow>
             </TableHeader>
             <TableBody>
-              <TableRow
+              <template
                 v-for="key in keyPage.keys"
                 :key="key.key_id"
-                class="border-b border-border/40 last:border-b-0 hover:bg-muted/30 transition-colors"
-                :class="getPoolKeyRowClass(key.key_id)"
               >
+                <TableRow
+                  class="border-b border-border/40 last:border-b-0 hover:bg-muted/30 transition-colors"
+                  :class="getPoolKeyRowClass(key.key_id)"
+                >
                 <TableCell
                   class="px-4 py-3 align-top"
                 >
@@ -421,6 +423,7 @@
                     :pool-key="key"
                     layout="desktop"
                     :action-ids="keyUiStateMap[key.key_id]?.desktopActionIds || []"
+                    :model-test-expanded="isModelTestExpanded(key.key_id)"
                     :can-refresh-token="keyUiStateMap[key.key_id]?.canRefreshToken ?? false"
                     :refresh-button-title="keyUiStateMap[key.key_id]?.oauthRefreshButtonTitle || ''"
                     :refreshing-oauth="refreshingOAuthKeyId === key.key_id"
@@ -436,6 +439,7 @@
                     @update:proxy-popover-open="(v: boolean) => handleProxyDesktopPopoverToggle(key.key_id, v)"
                     @select-proxy="(v: string) => setKeyProxy(key, v)"
                     @clear-proxy="clearKeyProxy(key)"
+                    @toggle-model-test="togglePoolKeyModelTest(key)"
                     @download="downloadRefreshToken(key)"
                     @copy="copyFullKey(key)"
                     @refresh-oauth="handleRefreshOAuth(key)"
@@ -449,7 +453,34 @@
                     @delete="handleDeleteKey(key)"
                   />
                 </TableCell>
-              </TableRow>
+                </TableRow>
+                <TableRow
+                  v-if="isModelTestExpanded(key.key_id)"
+                  class="border-b border-border/40 bg-muted/10 hover:bg-muted/10"
+                >
+                  <TableCell
+                    :colspan="showAccountQuotaColumn ? 8 : 7"
+                    class="p-3"
+                  >
+                    <PoolKeyModelTestPanel
+                      :pool-key="key"
+                      :provider-type="selectedProviderType"
+                      :endpoints="providerEndpoints"
+                      :models-state="poolKeyModelTest.getModelsState(key.key_id)"
+                      :custom-tested-models="poolKeyModelTest.getCustomTestedModels(key.key_id)"
+                      :get-model-result="poolKeyModelTest.getModelResult"
+                      :can-refresh-token="keyUiStateMap[key.key_id]?.canRefreshToken ?? false"
+                      :refreshing-oauth="refreshingOAuthKeyId === key.key_id"
+                      @refresh-models="handleRefreshPoolKeyModels(key)"
+                      @refresh-oauth="handleRefreshOAuth(key)"
+                      @test-model="(payload) => handleRunPoolKeyModelTest(key, payload)"
+                      @cancel-test="(payload) => handleCancelPoolKeyModelTest(key, payload)"
+                      @inspect-model="openPoolModelInspectDialog"
+                      @close="collapsePoolKeyModelTest(key.key_id)"
+                    />
+                  </TableCell>
+                </TableRow>
+              </template>
             </TableBody>
           </Table>
         </div>
@@ -623,6 +654,7 @@
                 :pool-key="key"
                 layout="mobile"
                 :action-ids="keyUiStateMap[key.key_id]?.mobileActionIds || []"
+                :model-test-expanded="isModelTestExpanded(key.key_id)"
                 :can-refresh-token="keyUiStateMap[key.key_id]?.canRefreshToken ?? false"
                 :refresh-button-title="keyUiStateMap[key.key_id]?.oauthRefreshButtonTitle || ''"
                 :refreshing-oauth="refreshingOAuthKeyId === key.key_id"
@@ -638,6 +670,7 @@
                 @update:proxy-popover-open="(v: boolean) => handleProxyMobilePopoverToggle(key.key_id, v)"
                 @select-proxy="(v: string) => setKeyProxy(key, v)"
                 @clear-proxy="clearKeyProxy(key)"
+                @toggle-model-test="togglePoolKeyModelTest(key)"
                 @download="downloadRefreshToken(key)"
                 @copy="copyFullKey(key)"
                 @refresh-oauth="handleRefreshOAuth(key)"
@@ -649,6 +682,24 @@
                 @edit="handleEditKey(key)"
                 @toggle-active="toggleKeyActive(key)"
                 @delete="handleDeleteKey(key)"
+              />
+
+              <PoolKeyModelTestPanel
+                v-if="isModelTestExpanded(key.key_id)"
+                :pool-key="key"
+                :provider-type="selectedProviderType"
+                :endpoints="providerEndpoints"
+                :models-state="poolKeyModelTest.getModelsState(key.key_id)"
+                :custom-tested-models="poolKeyModelTest.getCustomTestedModels(key.key_id)"
+                :get-model-result="poolKeyModelTest.getModelResult"
+                :can-refresh-token="keyUiStateMap[key.key_id]?.canRefreshToken ?? false"
+                :refreshing-oauth="refreshingOAuthKeyId === key.key_id"
+                @refresh-models="handleRefreshPoolKeyModels(key)"
+                @refresh-oauth="handleRefreshOAuth(key)"
+                @test-model="(payload) => handleRunPoolKeyModelTest(key, payload)"
+                @cancel-test="(payload) => handleCancelPoolKeyModelTest(key, payload)"
+                @inspect-model="openPoolModelInspectDialog"
+                @close="collapsePoolKeyModelTest(key.key_id)"
               />
             </div>
           </div>
@@ -794,6 +845,33 @@
       @close="closeKeyPermissionsDialog"
       @saved="handleDialogSaved"
     />
+    <ModelTestDialog
+      v-if="modelTestDialogMounted && selectedProviderId"
+      :open="inspectModelTest.dialogOpen.value"
+      :result="inspectModelTest.testResult.value"
+      mode="direct"
+      :provider-type="selectedProviderType || null"
+      :selecting-model-name="inspectDialogTitle"
+      :requested-model-name="inspectModelContext?.modelName ?? null"
+      :endpoints="inspectCompatibleEndpoints"
+      :selected-endpoint="inspectSelectedEndpoint"
+      :testing="inspectModelTest.testing.value"
+      :trace="inspectModelTest.testTrace.value"
+      :request-id="inspectModelTest.requestId.value"
+      :request-headers-draft="inspectHeadersDraft"
+      :request-headers-reset-value="inspectHeadersResetValue"
+      :request-headers-error="parsedInspectHeaders.error"
+      :request-body-draft="inspectBodyDraft"
+      :request-body-reset-value="inspectBodyResetValue"
+      :request-body-error="parsedInspectBody.error"
+      :start-disabled="inspectStartDisabled"
+      @close="handleInspectDialogClose"
+      @back="handleInspectDialogBack"
+      @start="handleStartInspectModelTest"
+      @select-endpoint="handleSelectInspectEndpoint"
+      @update:request-headers-draft="inspectHeadersDraft = $event"
+      @update:request-body-draft="inspectBodyDraft = $event"
+    />
   </div>
 </template>
 
@@ -863,6 +941,8 @@ import type {
   PoolAdvancedConfig,
   ProviderWithEndpointsSummary,
 } from '@/api/endpoints/types/provider'
+import type { ProviderEndpoint } from '@/api/endpoints/types'
+import { getProviderEndpoints } from '@/api/endpoints/endpoints'
 import { getProvider, updateProvider } from '@/api/endpoints'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import PoolSchedulingDialog from '@/features/pool/components/PoolSchedulingDialog.vue'
@@ -877,6 +957,24 @@ import PoolKeyHealthIndicator from '@/features/pool/components/PoolKeyHealthIndi
 import PoolKeyInferenceRejectionNote from '@/features/pool/components/PoolKeyInferenceRejectionNote.vue'
 import PoolKeyScorePopover from '@/features/pool/components/PoolKeyScorePopover.vue'
 import PoolKeyActionButtons from '@/features/pool/components/PoolKeyActionButtons.vue'
+import PoolKeyModelTestPanel, {
+  type PoolKeyModelInspectPayload,
+} from '@/features/pool/components/PoolKeyModelTestPanel.vue'
+import {
+  getCompatiblePoolKeyEndpoints,
+  normalizePoolModelTestResultForDialog,
+  selectDefaultPoolKeyEndpoint,
+  usePoolKeyModelTest,
+  type PoolAccountModelItem,
+} from '@/features/pool/composables/usePoolKeyModelTest'
+import { useModelTest } from '@/composables/useModelTest'
+import {
+  buildDefaultModelTestRequestBody,
+  buildDefaultModelTestRequestHeaders,
+  parseModelTestRequestBodyDraft,
+  parseModelTestRequestHeadersDraft,
+  syncModelTestRequestBodyDraft,
+} from '@/features/providers/components/provider-tabs/model-test-request'
 import KeyAllowedModelsEditDialog from '@/features/providers/components/KeyAllowedModelsEditDialog.vue'
 import KeyFormDialog from '@/features/providers/components/KeyFormDialog.vue'
 import OAuthKeyEditDialog from '@/features/providers/components/OAuthKeyEditDialog.vue'
@@ -1555,6 +1653,7 @@ async function selectProvider(
   proxyMobilePopoverOpenKeyId.value = null
   scoreDesktopPopoverOpenKeyId.value = null
   scoreMobilePopoverOpenKeyId.value = null
+  resetPoolKeyModelTests()
   suppressFiltersWatch = true
   if (!options.preservePagination) {
     currentPage.value = 1
@@ -1772,6 +1871,244 @@ const keyBatchEditDialogOpen = ref(false)
 const keyBatchEditKeyIds = ref<string[]>([])
 const oauthKeyEditDialogOpen = ref(false)
 const editingKeyDetail = ref<PoolKeyDetail | null>(null)
+const ModelTestDialog = defineAsyncComponent(
+  () => import('@/features/providers/components/provider-tabs/ModelTestDialog.vue'),
+)
+
+const expandedModelTestKeyIds = ref<Set<string>>(new Set())
+const providerEndpoints = ref<ProviderEndpoint[]>([])
+const loadedEndpointsProviderId = ref<string | null>(null)
+let providerEndpointsRequestId = 0
+
+const poolKeyModelTest = usePoolKeyModelTest({
+  providerId: () => selectedProviderId.value,
+  providerName: () => selectedProviderData.value?.name || selectedProviderOverview.value?.provider_name || '',
+})
+
+const modelTestDialogMounted = ref(false)
+const inspectModelContext = ref<PoolKeyModelInspectPayload | null>(null)
+const inspectSelectedEndpoint = ref<ProviderEndpoint | null>(null)
+const inspectHeadersDraft = ref('')
+const inspectHeadersResetValue = ref('')
+const inspectBodyDraft = ref('')
+const inspectBodyResetValue = ref('')
+
+const inspectModelTest = useModelTest({
+  providerId: () => selectedProviderId.value || '',
+})
+
+const inspectCompatibleEndpoints = computed(() => {
+  if (!inspectModelContext.value) return []
+  return getCompatiblePoolKeyEndpoints(
+    inspectModelContext.value.poolKey,
+    providerEndpoints.value,
+    selectedProviderType.value,
+  )
+})
+
+const parsedInspectHeaders = computed(() => parseModelTestRequestHeadersDraft(inspectHeadersDraft.value))
+const parsedInspectBody = computed(() => parseModelTestRequestBodyDraft(inspectBodyDraft.value))
+const inspectStartDisabled = computed(() => (
+  inspectModelTest.testing.value
+  || !inspectModelContext.value
+  || Boolean(parsedInspectHeaders.value.error)
+  || Boolean(parsedInspectBody.value.error)
+))
+const inspectDialogTitle = computed(() => {
+  if (!inspectModelContext.value) return null
+  const accountName = inspectModelContext.value.poolKey.key_name || inspectModelContext.value.poolKey.key_id
+  return `${inspectModelContext.value.modelName} (${accountName})`
+})
+
+function isModelTestExpanded(keyId: string): boolean {
+  return expandedModelTestKeyIds.value.has(keyId)
+}
+
+function collapsePoolKeyModelTest(keyId: string): void {
+  if (!expandedModelTestKeyIds.value.has(keyId)) return
+  const next = new Set(expandedModelTestKeyIds.value)
+  next.delete(keyId)
+  expandedModelTestKeyIds.value = next
+}
+
+function resetPoolKeyModelTests(): void {
+  providerEndpointsRequestId += 1
+  expandedModelTestKeyIds.value = new Set()
+  providerEndpoints.value = []
+  loadedEndpointsProviderId.value = null
+  poolKeyModelTest.resetAll()
+  handleInspectDialogClose()
+}
+
+async function ensureProviderEndpointsLoaded(providerId: string): Promise<void> {
+  if (!providerId || loadedEndpointsProviderId.value === providerId) return
+  const requestId = ++providerEndpointsRequestId
+  try {
+    const endpoints = await getProviderEndpoints(providerId)
+    if (requestId !== providerEndpointsRequestId || selectedProviderId.value !== providerId) return
+    providerEndpoints.value = Array.isArray(endpoints) ? endpoints : []
+    loadedEndpointsProviderId.value = providerId
+  } catch {
+    if (requestId !== providerEndpointsRequestId || selectedProviderId.value !== providerId) return
+    providerEndpoints.value = []
+  }
+}
+
+function togglePoolKeyModelTest(key: PoolKeyDetail): void {
+  const next = new Set(expandedModelTestKeyIds.value)
+  if (next.has(key.key_id)) {
+    next.delete(key.key_id)
+    expandedModelTestKeyIds.value = next
+    return
+  }
+  next.add(key.key_id)
+  expandedModelTestKeyIds.value = next
+  const providerId = selectedProviderId.value
+  if (providerId) {
+    void ensureProviderEndpointsLoaded(providerId)
+  }
+  void poolKeyModelTest.fetchModelsForKey(key.key_id)
+}
+
+function handleRefreshPoolKeyModels(key: PoolKeyDetail): void {
+  const providerId = selectedProviderId.value
+  if (providerId) {
+    void ensureProviderEndpointsLoaded(providerId)
+  }
+  void poolKeyModelTest.fetchModelsForKey(key.key_id, { forceRefresh: true })
+}
+
+function handleRunPoolKeyModelTest(
+  key: PoolKeyDetail,
+  payload: { modelName: string; endpoint: ProviderEndpoint | null; modelMeta: PoolAccountModelItem | null; isCustom?: boolean },
+): void {
+  if (payload.isCustom) {
+    poolKeyModelTest.rememberCustomModel(key.key_id, payload.modelName)
+  }
+  void poolKeyModelTest.runModelTest({
+    keyId: key.key_id,
+    modelName: payload.modelName,
+    endpoint: payload.endpoint,
+    modelMeta: payload.modelMeta,
+  })
+}
+
+function handleCancelPoolKeyModelTest(
+  key: PoolKeyDetail,
+  payload: { modelName: string; endpoint: ProviderEndpoint | null },
+): void {
+  poolKeyModelTest.cancelModelTest(key.key_id, payload.modelName, payload.endpoint?.id ?? null)
+}
+
+function openPoolModelInspectDialog(payload: PoolKeyModelInspectPayload): void {
+  const providerId = selectedProviderId.value
+  if (!providerId) return
+  modelTestDialogMounted.value = true
+  inspectModelContext.value = payload
+  const compatible = getCompatiblePoolKeyEndpoints(
+    payload.poolKey,
+    providerEndpoints.value,
+    selectedProviderType.value,
+  )
+  const resolvedEndpoint = payload.endpoint
+    ?? selectDefaultPoolKeyEndpoint(compatible, payload.modelMeta)
+  inspectSelectedEndpoint.value = resolvedEndpoint
+  inspectHeadersResetValue.value = buildDefaultModelTestRequestHeaders()
+  inspectHeadersDraft.value = payload.result?.requestHeaders && Object.keys(payload.result.requestHeaders).length > 0
+    ? JSON.stringify(payload.result.requestHeaders, null, 2)
+    : inspectHeadersResetValue.value
+  inspectBodyResetValue.value = buildDefaultModelTestRequestBody(
+    payload.modelName,
+    resolvedEndpoint?.api_format,
+    payload.modelMeta ?? null,
+  )
+  inspectBodyDraft.value = payload.result?.requestBody
+    ? JSON.stringify(payload.result.requestBody, null, 2)
+    : inspectBodyResetValue.value
+  if (payload.result && payload.result.status !== 'idle') {
+    const providerName = selectedProviderData.value?.name
+      || selectedProviderOverview.value?.provider_name
+      || providerId
+    inspectModelTest.testResult.value = normalizePoolModelTestResultForDialog(
+      payload.result,
+      providerId,
+      providerName,
+      payload.poolKey,
+    )
+  } else {
+    inspectModelTest.testResult.value = null
+  }
+  inspectModelTest.dialogOpen.value = true
+}
+
+function handleSelectInspectEndpoint(endpointId: string): void {
+  const endpoint = inspectCompatibleEndpoints.value.find(item => item.id === endpointId)
+  if (!endpoint || !inspectModelContext.value) return
+  inspectSelectedEndpoint.value = endpoint
+  const nextReset = buildDefaultModelTestRequestBody(
+    inspectModelContext.value.modelName,
+    endpoint.api_format,
+    inspectModelContext.value.modelMeta ?? null,
+  )
+  const synced = syncModelTestRequestBodyDraft(
+    inspectBodyDraft.value,
+    inspectBodyResetValue.value,
+    nextReset,
+    inspectModelContext.value.modelName,
+  )
+  inspectBodyDraft.value = synced.draft
+  inspectBodyResetValue.value = synced.resetValue
+}
+
+function handleInspectDialogClose(): void {
+  inspectModelTest.resetState()
+  inspectModelContext.value = null
+  inspectSelectedEndpoint.value = null
+  inspectHeadersDraft.value = ''
+  inspectHeadersResetValue.value = ''
+  inspectBodyDraft.value = ''
+  inspectBodyResetValue.value = ''
+}
+
+function handleInspectDialogBack(): void {
+  if (inspectModelTest.testing.value) return
+  inspectModelTest.testResult.value = null
+  inspectModelTest.stopPolling()
+}
+
+async function handleStartInspectModelTest(): Promise<void> {
+  if (inspectModelTest.testing.value || !inspectModelContext.value) return
+  const { value: requestHeaders, error: headersError } = parsedInspectHeaders.value
+  if (!requestHeaders || headersError) {
+    showError(t('providers.migration.invalidTestRequestHeaders73f57d', { value: String(headersError || t('ui.invalidJson')) }))
+    return
+  }
+  const { value: requestBody, error: bodyError } = parsedInspectBody.value
+  if (!requestBody || bodyError) {
+    showError(t('providers.migration.invalidTestRequestBody4d0d50', { value: String(bodyError || t('ui.invalidJson')) }))
+    return
+  }
+  const endpoint = inspectSelectedEndpoint.value
+  const context = inspectModelContext.value
+  await inspectModelTest.startTest({
+    mode: 'direct',
+    modelName: context.modelName,
+    displayLabel: `${context.modelName} (${context.poolKey.key_name || context.poolKey.key_id})`,
+    apiFormat: endpoint?.api_format,
+    endpointId: endpoint?.id,
+    endpointBaseUrl: endpoint?.base_url,
+    apiKeyIds: [context.poolKey.key_id],
+    applyModelMapping: false,
+    requestHeaders,
+    requestBody,
+  })
+}
+
+watch([currentPage, pageSize, statusFilter], () => {
+  if (expandedModelTestKeyIds.value.size > 0) {
+    expandedModelTestKeyIds.value = new Set()
+  }
+})
 
 function clearPoolKeyFilters() {
   if (!hasPoolKeyFilters.value) return
@@ -2008,6 +2345,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
       }).primary,
       ...getPoolKeyModelFetchDisplay(key, providerType),
       desktopActionIds: [
+        'model_test',
         ...(key.cooldown_reason ? ['clear_cooldown' as const] : []),
         ...(canResetCycleStats(key) ? ['reset_cycle_stats' as const] : []),
         ...(isQuotaSchedulingBlocked(key) ? ['restore_quota' as const] : []),

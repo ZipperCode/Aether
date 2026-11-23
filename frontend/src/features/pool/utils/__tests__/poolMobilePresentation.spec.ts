@@ -42,6 +42,7 @@ describe('poolMobilePresentation', () => {
       }),
     ).toEqual({
       primary: [
+        'model_test',
         'copy_or_download',
         'refresh_token',
         'reset_cycle_stats',

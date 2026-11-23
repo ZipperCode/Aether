@@ -170,6 +170,10 @@ vi.mock('lucide-vue-next', async () => {
     Eye: Icon,
     ListChecks: Icon,
     SquareCheckBig: Icon,
+    FlaskConical: Icon,
+    Play: Icon,
+    Loader2: Icon,
+    X: Icon,
   }
 })
 

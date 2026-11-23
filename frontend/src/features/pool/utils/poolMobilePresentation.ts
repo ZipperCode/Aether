@@ -19,6 +19,7 @@ export interface PoolMobileTagInput {
 }
 
 export type PoolMobileActionId =
+  | 'model_test'
   | 'copy_or_download'
   | 'refresh_token'
   | 'reset_cycle_stats'
@@ -30,7 +31,6 @@ export type PoolMobileActionId =
   | 'edit'
   | 'toggle'
   | 'delete'
-
 export interface PoolMobileActionInput {
   canDownloadOrCopy?: boolean
   canRefreshToken?: boolean
@@ -70,7 +70,7 @@ export function splitPoolMobileActions(input: PoolMobileActionInput): {
   const showRefreshToken = input.showRefreshToken ?? input.canRefreshToken
 
   if (input.canDownloadOrCopy) {
-    const primary: PoolMobileActionId[] = ['copy_or_download']
+    const primary: PoolMobileActionId[] = ['model_test', 'copy_or_download']
     if (showRefreshToken) {
       primary.push('refresh_token')
     }
@@ -98,7 +98,7 @@ export function splitPoolMobileActions(input: PoolMobileActionInput): {
     }
   }
 
-  const primary: PoolMobileActionId[] = []
+  const primary: PoolMobileActionId[] = ['model_test']
   if (showRefreshToken) {
     primary.push('refresh_token')
   }

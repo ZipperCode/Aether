@@ -1614,3 +1614,39 @@ fn provider_query_dall_e_3_image_test_keeps_single_generation_boundary() {
         "Provider request body could not be normalized for openai:image: selected provider supports n=1..1 for generation"
     );
 }
+
+#[test]
+fn provider_query_key_eligible_for_test_allows_explicit_inactive_key_only() {
+    let mut inactive_key = StoredProviderCatalogKey::new(
+        "key-inactive".to_string(),
+        "provider-1".to_string(),
+        "Inactive Account".to_string(),
+        "api_key".to_string(),
+        None,
+        false,
+    )
+    .expect("inactive key should build");
+    inactive_key.is_active = false;
+    let active_key = StoredProviderCatalogKey::new(
+        "key-active".to_string(),
+        "provider-1".to_string(),
+        "Active Account".to_string(),
+        "api_key".to_string(),
+        None,
+        true,
+    )
+    .expect("active key should build");
+
+    assert!(!provider_query_key_eligible_for_test(&inactive_key, None));
+    assert!(provider_query_key_eligible_for_test(&active_key, None));
+
+    let selected = BTreeSet::from(["key-inactive".to_string()]);
+    assert!(provider_query_key_eligible_for_test(
+        &inactive_key,
+        Some(&selected)
+    ));
+    assert!(!provider_query_key_eligible_for_test(
+        &active_key,
+        Some(&selected)
+    ));
+}
