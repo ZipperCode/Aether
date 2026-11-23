@@ -4845,7 +4845,7 @@ mod tests {
                 provider_actual_service_tier: None,
                 observed_finish: true,
                 unknown_event_count: 0,
-                parser_error: None,
+                ..ExecutionStreamTerminalSummary::default()
             }),
             telemetry: None,
         };
@@ -5052,7 +5052,8 @@ mod tests {
                 provider_actual_service_tier: Some("Default".to_string()),
                 observed_finish: true,
                 unknown_event_count: 0,
-                parser_error: None,
+                observation_error: Some("stream usage event exceeded observation limit".into()),
+                ..ExecutionStreamTerminalSummary::default()
             }),
             telemetry: None,
         };
@@ -5061,6 +5062,8 @@ mod tests {
             build_stream_terminal_usage_event(&plan, payload.report_context.as_ref(), &payload)
                 .expect("usage event should build");
 
+        assert_eq!(event.event_type, UsageEventType::Completed);
+        assert!(event.data.error_category.is_none());
         assert_eq!(event.data.input_tokens, Some(13));
         assert_eq!(event.data.output_tokens, Some(21));
         assert_eq!(event.data.total_tokens, Some(34));
@@ -5516,7 +5519,7 @@ mod tests {
                 provider_actual_service_tier: None,
                 observed_finish: true,
                 unknown_event_count: 0,
-                parser_error: None,
+                ..ExecutionStreamTerminalSummary::default()
             }),
             telemetry: None,
         };
@@ -5775,7 +5778,7 @@ mod tests {
                 provider_actual_service_tier: None,
                 observed_finish: true,
                 unknown_event_count: 0,
-                parser_error: None,
+                ..ExecutionStreamTerminalSummary::default()
             }),
             telemetry: None,
         };

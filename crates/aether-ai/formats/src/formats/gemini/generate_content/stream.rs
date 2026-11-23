@@ -76,6 +76,11 @@ pub struct GeminiProviderState {
 }
 
 impl GeminiProviderState {
+    /// EOF 收尾前检查协议状态，不能仅凭某一个候选结束就确认整条流完成。
+    pub(crate) fn observed_end(&self) -> bool {
+        self.finished
+    }
+
     pub(crate) fn terminal_observation() -> Self {
         Self {
             terminal_observation_only: true,

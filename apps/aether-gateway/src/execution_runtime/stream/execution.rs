@@ -1080,17 +1080,15 @@ fn append_budgeted_stream_capture_bytes(
 }
 
 struct StreamUsageObservationBuffer {
-    line: Vec<u8>,
     fallback: StreamUsageFallback,
-    recovered_usage_after_parser_error: bool,
+    recovered_usage: bool,
 }
 
 impl StreamUsageObservationBuffer {
     fn new(record_limit: usize) -> Self {
         Self {
-            line: Vec::new(),
             fallback: StreamUsageFallback::new(record_limit),
-            recovered_usage_after_parser_error: false,
+            recovered_usage: false,
         }
     }
 }
@@ -1102,60 +1100,20 @@ fn observe_stream_usage_bytes(
     chunk: &[u8],
 ) {
     buffer.fallback.observe(report_context, chunk);
-    let buffered = &mut buffer.line;
-    if chunk.is_empty()
-        || observer
-            .latest_summary()
-            .and_then(|summary| summary.parser_error.as_deref())
-            .is_some()
-    {
-        return;
-    }
-
-    let mut remaining = chunk;
-    while !remaining.is_empty() {
-        let line_part_len = remaining
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(remaining.len(), |index| index + 1);
-        if buffered.len().saturating_add(line_part_len) > SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES {
-            observer.disable_with_error(format!(
-                "stream usage event exceeded {SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES} bytes"
-            ));
-            *buffered = Vec::new();
-            return;
-        }
-        buffered.extend_from_slice(&remaining[..line_part_len]);
-        remaining = &remaining[line_part_len..];
-        if buffered.last() == Some(&b'\n') {
-            let line = std::mem::take(buffered);
-            if let Err(_err) = observer.push_line(report_context, line) {
-                observer.disable_with_error("stream usage parsing failed");
-                *buffered = Vec::new();
-                return;
-            }
-        }
-    }
+    observer.push_bytes(report_context, chunk);
 }
 
 fn finalize_stream_usage_observer(
     observer: &mut Option<StreamingStandardTerminalObserver>,
     report_context: Option<&Value>,
     buffer: &mut StreamUsageObservationBuffer,
+    confirmed_end: bool,
 ) -> Option<ExecutionStreamTerminalSummary> {
     let (Some(observer), Some(report_context)) = (observer.as_mut(), report_context) else {
         return None;
     };
 
-    let buffered = &mut buffer.line;
-    if !buffered.is_empty() {
-        let line = std::mem::take(buffered);
-        if let Err(_err) = observer.push_line(report_context, line) {
-            observer.disable_with_error("stream usage parsing failed");
-        }
-    }
-
-    let mut summary = match observer.finish(report_context) {
+    let mut summary = match observer.finish_with_confirmed_end(report_context, confirmed_end) {
         Ok(summary) => summary,
         Err(_err) => {
             observer.disable_with_error("stream usage parsing failed");
@@ -1165,12 +1123,14 @@ fn finalize_stream_usage_observer(
     let mut fallback_usage = buffer.fallback.finish(report_context);
     let fallback_tier = buffer.fallback.take_service_tier();
     if let Some(summary) = summary.as_mut() {
-        if summary.parser_error.is_some() && fallback_usage.is_some() {
-            // A disabled parser can retain an earlier usage snapshot. Later
-            // complete fallback events remain authoritative even when their
+        if (summary.parser_error.is_some() || summary.observation_error.is_some())
+            && fallback_usage.is_some()
+        {
+            // A disabled or gap-affected parser can retain an earlier usage snapshot.
+            // Later complete fallback events remain authoritative even when their
             // signal score is unchanged or an explicit zero reduces it.
             summary.standardized_usage = fallback_usage.take();
-            buffer.recovered_usage_after_parser_error = true;
+            buffer.recovered_usage = true;
         }
         if summary.provider_actual_service_tier.is_none() {
             summary.provider_actual_service_tier = fallback_tier.clone();
@@ -1190,7 +1150,7 @@ fn merge_observed_stream_terminal_summary(
     usage_buffer: &StreamUsageObservationBuffer,
 ) -> Option<ExecutionStreamTerminalSummary> {
     let recovered_usage = usage_buffer
-        .recovered_usage_after_parser_error
+        .recovered_usage
         .then(|| {
             observed
                 .as_ref()
@@ -1240,6 +1200,9 @@ fn merge_stream_terminal_summary(
         .saturating_add(observed.unknown_event_count);
     if current_summary.parser_error.is_none() {
         current_summary.parser_error = observed.parser_error;
+    }
+    if current_summary.observation_error.is_none() {
+        current_summary.observation_error = observed.observation_error;
     }
 
     current
@@ -2352,6 +2315,10 @@ impl DirectPassthroughFinalizerCore {
             &mut self.stream_usage_observer,
             self.stream_usage_report_context.as_ref(),
             &mut self.stream_usage_observer_buffered,
+            self.terminal_failure.is_none()
+                && self
+                    .client_stream_completion_tracker
+                    .successful_completion(),
         );
 
         let DirectPassthroughFinalizerCore {
@@ -3722,6 +3689,7 @@ async fn execute_stream_from_direct_passthrough(
             &mut stream_usage_observer,
             stream_usage_report_context.as_ref(),
             &mut stream_usage_observer_buffered,
+            terminal_failure.is_none() && client_stream_completion_tracker.successful_completion(),
         );
 
         if downstream_dropped && client_visible_stream_completed && terminal_failure.is_none() {
@@ -9558,10 +9526,19 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
         idle_monitor_done.store(true, Ordering::Relaxed);
         idle_monitor_handle.abort();
 
+        // A client-format rewriter may emit a stop event at EOF. Only the provider
+        // frame summary can corroborate an end skipped by the usage observer here.
+        let confirmed_end = terminal_failure.is_none()
+            && stream_terminal_summary.as_ref().is_some_and(|summary| {
+                summary.observed_finish
+                    && summary.parser_error.is_none()
+                    && summary.finish_reason.as_deref() != Some("error")
+            });
         let observed_terminal_summary = finalize_stream_usage_observer(
             &mut stream_usage_observer,
             stream_usage_report_context.as_ref(),
             &mut stream_usage_observer_buffered,
+            confirmed_end,
         );
         stream_terminal_summary = merge_observed_stream_terminal_summary(
             stream_terminal_summary,
@@ -11636,6 +11613,7 @@ pub(crate) mod tests {
                 &mut core.stream_usage_observer,
                 core.stream_usage_report_context.as_ref(),
                 &mut core.stream_usage_observer_buffered,
+                false,
             )
             .unwrap();
             assert!(summary.observed_finish);
@@ -11671,7 +11649,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stream_capture_fallback_after_disabled_observer_updates_tokens_zero_cache_and_tier() {
+    fn stream_capture_fallback_after_skipped_event_updates_tokens_zero_cache_and_tier() {
         let context = json!({"provider_api_format": "openai:chat"});
         let mut observer = Some(super::StreamingStandardTerminalObserver::default());
         let mut buffer =
@@ -11692,14 +11670,19 @@ pub(crate) mod tests {
         }
         super::observe_stream_usage_bytes(observer.as_mut().unwrap(), &context, &mut buffer,
             b"data: {\"\\u0075sage\":{\"prompt_tokens\":100,\"completion_tokens\":500,\"prompt_tokens_details\":{\"cached_tokens\":0}},\"service_tier\":\"priority\"}\n\n");
-        let summary =
-            super::finalize_stream_usage_observer(&mut observer, Some(&context), &mut buffer)
-                .unwrap();
+        let summary = super::finalize_stream_usage_observer(
+            &mut observer,
+            Some(&context),
+            &mut buffer,
+            false,
+        )
+        .unwrap();
         assert!(summary
-            .parser_error
+            .observation_error
             .as_deref()
             .unwrap()
             .contains("exceeded"));
+        assert!(summary.parser_error.is_none());
         assert!(summary.observed_finish);
         assert_eq!(
             summary.provider_actual_service_tier.as_deref(),
@@ -11731,11 +11714,104 @@ pub(crate) mod tests {
         assert_eq!(merged.response_id.as_deref(), Some("authoritative-eof-id"));
         assert_eq!(merged.finish_reason.as_deref(), Some("stop"));
         assert!(merged.observed_finish);
-        assert!(merged.parser_error.as_deref().unwrap().contains("exceeded"));
+        assert!(merged.parser_error.is_none());
+        assert!(merged
+            .observation_error
+            .as_deref()
+            .unwrap()
+            .contains("exceeded"));
+        assert!(
+            !super::stream_terminal_summary_represents_failure_with_requirement(
+                Some(&merged),
+                true
+            )
+        );
         let usage = merged.standardized_usage.unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 500);
         assert_eq!(usage.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn stream_usage_observer_confirmed_end_respects_provider_failure_and_observation_gap() {
+        let context = json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:responses",
+        });
+        let oversized = format!(
+            "data: {{\"content\":\"{}\"}}\n\n",
+            "x".repeat(super::SSE_TERMINAL_DETECTOR_MAX_LINE_BYTES)
+        );
+
+        let mut tracker = super::ClientVisibleStreamCompletionTracker::default();
+        let mut observer = Some(super::StreamingStandardTerminalObserver::default());
+        let mut buffer =
+            super::StreamUsageObservationBuffer::new(super::BASIC_STREAM_BODY_ANALYSIS_LIMIT_BYTES);
+        tracker.observe_chunk(oversized.as_bytes());
+        super::observe_stream_usage_bytes(
+            observer.as_mut().unwrap(),
+            &context,
+            &mut buffer,
+            oversized.as_bytes(),
+        );
+        let failed_event = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"upstream failed\"}}}\n\n";
+        assert!(tracker.observe_chunk(failed_event));
+        assert!(!tracker.successful_completion());
+        super::observe_stream_usage_bytes(
+            observer.as_mut().unwrap(),
+            &context,
+            &mut buffer,
+            failed_event,
+        );
+        let failed_summary = super::finalize_stream_usage_observer(
+            &mut observer,
+            Some(&context),
+            &mut buffer,
+            tracker.successful_completion(),
+        )
+        .unwrap();
+        assert!(failed_summary.observation_error.is_some());
+        assert!(failed_summary
+            .parser_error
+            .as_deref()
+            .is_some_and(|err| err.contains("upstream failed")));
+        assert!(
+            super::stream_terminal_summary_represents_failure_with_requirement(
+                Some(&failed_summary),
+                true
+            )
+        );
+
+        let mut ok_tracker = super::ClientVisibleStreamCompletionTracker::default();
+        let mut ok_observer = Some(super::StreamingStandardTerminalObserver::default());
+        let mut ok_buffer =
+            super::StreamUsageObservationBuffer::new(super::BASIC_STREAM_BODY_ANALYSIS_LIMIT_BYTES);
+        ok_tracker.observe_chunk(oversized.as_bytes());
+        super::observe_stream_usage_bytes(
+            ok_observer.as_mut().unwrap(),
+            &context,
+            &mut ok_buffer,
+            oversized.as_bytes(),
+        );
+        let completed_event = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+        assert!(ok_tracker.observe_chunk(completed_event));
+        assert!(ok_tracker.successful_completion());
+        let ok_summary = super::finalize_stream_usage_observer(
+            &mut ok_observer,
+            Some(&context),
+            &mut ok_buffer,
+            ok_tracker.successful_completion(),
+        )
+        .unwrap();
+        assert!(ok_summary.observation_error.is_some());
+        assert!(ok_summary.observed_finish);
+        assert!(ok_summary.parser_error.is_none());
+        assert!(
+            !super::stream_terminal_summary_represents_failure_with_requirement(
+                Some(&ok_summary),
+                true
+            )
+        );
     }
 
     #[test]
@@ -11782,9 +11858,13 @@ pub(crate) mod tests {
             let tail = rewriter.finish().unwrap();
             client.append(&tail, 32 * 1024, &mut client_truncated);
             delivered.extend(tail);
-            let summary =
-                super::finalize_stream_usage_observer(&mut observer, Some(&context), &mut buffer)
-                    .unwrap();
+            let summary = super::finalize_stream_usage_observer(
+                &mut observer,
+                Some(&context),
+                &mut buffer,
+                false,
+            )
+            .unwrap();
             assert!(summary.observed_finish);
             assert!(summary.parser_error.is_none());
             let payload = super::build_stream_usage_payload(

@@ -15,7 +15,7 @@ use crate::formats::openai::responses::history::{
 use crate::formats::shared::error_body::{
     build_core_error_body_for_client_format, LocalCoreSyncErrorKind,
 };
-use crate::formats::shared::sse::encode_json_sse;
+use crate::formats::shared::sse::{encode_json_sse, SseRecord, SseRecordReader};
 use crate::formats::shared::stream_core::common::{
     canonical_usage_from_claude_usage, canonical_usage_from_gemini_usage,
     canonical_usage_from_openai_usage, decode_json_data_line, openai_stream_terminal_error_body,
@@ -367,14 +367,58 @@ fn apply_sse_event_type(pending_sse_event: &mut Option<String>, line: Vec<u8>) -
     normalized
 }
 
-#[derive(Default)]
 pub struct StreamingStandardTerminalObserver {
     provider: Option<TerminalStreamParser>,
     latest_summary: Option<ExecutionStreamTerminalSummary>,
     pending_sse_event: Option<String>,
+    records: SseRecordReader,
+    observation_error: Option<String>,
+}
+
+const OBSERVATION_RECORD_LIMIT: usize = 1024 * 1024;
+
+impl Default for StreamingStandardTerminalObserver {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            latest_summary: None,
+            pending_sse_event: None,
+            records: SseRecordReader::new(OBSERVATION_RECORD_LIMIT),
+            observation_error: None,
+        }
+    }
 }
 
 impl StreamingStandardTerminalObserver {
+    pub fn push_bytes(&mut self, report_context: &Value, mut bytes: &[u8]) {
+        while let Some(record) = self.records.next_record(&mut bytes) {
+            match record {
+                Ok(record) => self.observe_record(report_context, record),
+                Err(_) => {
+                    self.observation_error.get_or_insert_with(|| {
+                        format!("stream usage event exceeded {OBSERVATION_RECORD_LIMIT} bytes")
+                    });
+                }
+            }
+        }
+    }
+
+    fn observe_record(&mut self, report_context: &Value, record: SseRecord) {
+        let Some(line) = record.into_data_line() else {
+            return;
+        };
+        let result = self.push_line(report_context, line).and_then(|()| {
+            if matches!(self.provider, Some(TerminalStreamParser::OpenAIImage(_))) {
+                self.push_line(report_context, Vec::new())?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            self.observation_error
+                .get_or_insert_with(|| "stream usage parsing failed".into());
+        }
+    }
+
     pub fn push_line(
         &mut self,
         report_context: &Value,
@@ -447,14 +491,59 @@ impl StreamingStandardTerminalObserver {
         &mut self,
         report_context: &Value,
     ) -> Result<Option<ExecutionStreamTerminalSummary>, AiSurfaceFinalizeError> {
+        self.finish_with_confirmed_end(report_context, false)
+    }
+
+    pub fn finish_with_confirmed_end(
+        &mut self,
+        report_context: &Value,
+        confirmed_end: bool,
+    ) -> Result<Option<ExecutionStreamTerminalSummary>, AiSurfaceFinalizeError> {
+        if let Some(record) = self.records.finish() {
+            self.observe_record(report_context, record);
+        }
+        let result = self.finish_protocol(report_context, confirmed_end);
+        if let Some(error) = self.observation_error.as_ref() {
+            let summary = self.latest_summary.get_or_insert_with(Default::default);
+            summary
+                .observation_error
+                .get_or_insert_with(|| error.clone());
+        }
+        result?;
+        Ok(self.latest_summary.clone())
+    }
+
+    fn finish_protocol(
+        &mut self,
+        report_context: &Value,
+        confirmed_end: bool,
+    ) -> Result<(), AiSurfaceFinalizeError> {
         self.ensure_initialized(report_context);
         let Some(provider) = self.provider.as_mut() else {
-            return Ok(self.latest_summary.clone());
+            return Ok(());
         };
         match provider {
             TerminalStreamParser::Standard(provider) => {
+                let gap = self.observation_error.is_some();
+                let observed_end_after_gap = gap && (confirmed_end || provider.observed_end());
+                // EOF alone cannot establish success across a gap in observation.
+                if gap && !observed_end_after_gap {
+                    let summary = self.latest_summary.get_or_insert_with(Default::default);
+                    if summary.parser_error.is_none() {
+                        summary.observed_finish = false;
+                        summary.finish_reason = None;
+                        summary.parser_error =
+                            Some("Upstream stream ended without a confirmed terminal event".into());
+                    }
+                    return Ok(());
+                }
                 let frames = provider.finish(report_context)?;
                 self.observe_frames(frames);
+                if observed_end_after_gap {
+                    self.latest_summary
+                        .get_or_insert_with(Default::default)
+                        .observed_finish = true;
+                }
             }
             TerminalStreamParser::OpenAIImage(provider) => {
                 if let Some(summary) = provider.finish(report_context)? {
@@ -462,7 +551,7 @@ impl StreamingStandardTerminalObserver {
                 }
             }
         }
-        Ok(self.latest_summary.clone())
+        Ok(())
     }
 
     pub fn disable_with_error(&mut self, parser_error: impl Into<String>) {
@@ -600,6 +689,16 @@ enum ProviderStreamParser {
 }
 
 impl ProviderStreamParser {
+    /// Wire evidence before `finish` is allowed to synthesize an EOF frame.
+    fn observed_end(&self) -> bool {
+        match self {
+            Self::OpenAIChat(state) => state.observed_end,
+            Self::OpenAIResponses(state) => state.observed_end(),
+            Self::Claude(state) => state.observed_end,
+            Self::Gemini(state) => state.observed_end(),
+        }
+    }
+
     fn for_api_format(provider_api_format: &str) -> Option<Self> {
         Some(match FormatId::parse(provider_api_format)? {
             FormatId::OpenAiChat => Self::OpenAIChat(OpenAIChatProviderState::default()),
@@ -3917,6 +4016,62 @@ mod structured_entry_tests {
             summary.standardized_usage.is_none(),
             "a synthesized finish carries no usage"
         );
+    }
+
+    #[test]
+    fn skipped_usage_record_preserves_provider_failures_and_confirmed_end() {
+        let context = report_context();
+        let truncated_record = format!("data: {}\n\n", "x".repeat(super::OBSERVATION_RECORD_LIMIT));
+        let observe = |tail: &[u8], confirmed_end| {
+            let mut observer = StreamingStandardTerminalObserver::default();
+            observer.push_bytes(&context, truncated_record.as_bytes());
+            observer.push_bytes(&context, tail);
+            let summary = observer
+                .finish_with_confirmed_end(&context, confirmed_end)
+                .unwrap()
+                .unwrap();
+            assert!(summary
+                .observation_error
+                .as_deref()
+                .unwrap()
+                .contains("exceeded"));
+            summary
+        };
+        let missing = observe(b"", false);
+        assert!(!missing.observed_finish);
+        assert!(missing
+            .parser_error
+            .as_deref()
+            .unwrap()
+            .contains("without a confirmed terminal event"));
+        assert!(observe(b"", true).parser_error.is_none());
+
+        let failure = observe(
+            b"event: response.failed\r\ndata: {\"response\":\r\ndata: {\"status\":\"failed\",\"error\":{\"message\":\"generation failed\"}}}",
+            true,
+        );
+        assert!(failure.observed_finish);
+        assert!(failure
+            .parser_error
+            .as_deref()
+            .unwrap()
+            .contains("generation failed"));
+    }
+
+    #[test]
+    fn terminal_marker_after_skipped_chat_body_confirms_completion_without_usage() {
+        let context = json!({"provider_api_format": "openai:chat"});
+        let mut observer = StreamingStandardTerminalObserver::default();
+        let wire = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            "x".repeat(super::OBSERVATION_RECORD_LIMIT)
+        );
+        observer.push_bytes(&context, wire.as_bytes());
+        let summary = observer.finish(&context).unwrap().unwrap();
+        assert!(summary.observed_finish);
+        assert!(summary.parser_error.is_none());
+        assert!(summary.standardized_usage.is_none());
+        assert!(summary.observation_error.is_some());
     }
 
     /// `openai:image` 没有结构化入口：必须显式报错，让调用方标记 parser_error，

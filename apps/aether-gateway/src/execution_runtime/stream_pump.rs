@@ -35,7 +35,6 @@ use crate::execution_runtime::transport::{
 use crate::execution_runtime::DirectUpstreamStreamExecution;
 use crate::GatewayError;
 
-const STREAM_USAGE_OBSERVER_MAX_LINE_BYTES: usize = 1024 * 1024;
 const UPSTREAM_STREAM_READ_ERROR_MESSAGE: &str = "Upstream response stream failed";
 
 /// 帧泵桥接标记：仅在真实完成同步 JSON→客户端 SSE 桥接时写入帧头。
@@ -91,7 +90,6 @@ pub(crate) fn build_direct_execution_frame_stream(
             maybe_build_provider_private_stream_normalizer(Some(&observer_context));
         let mut stream_terminal_observer = StreamingStandardTerminalObserver::default();
         let mut stream_completion = ClientVisibleStreamCompletionTracker::with_started_at(started_at);
-        let mut observer_buffered = Vec::new();
 
         if should_buffer_non_stream_response(
             &headers,
@@ -288,7 +286,6 @@ pub(crate) fn build_direct_execution_frame_stream(
                         &mut stream_terminal_observer,
                         &normalized_observer_context,
                         private_stream_normalizer.as_mut(),
-                        &mut observer_buffered,
                         chunk.as_ref(),
                     );
                     match encode_data_frame(&chunk) {
@@ -397,7 +394,6 @@ pub(crate) fn build_direct_execution_frame_stream(
                         &mut stream_terminal_observer,
                         &normalized_observer_context,
                         private_stream_normalizer.as_mut(),
-                        &mut observer_buffered,
                         chunk.as_ref(),
                     );
                     match encode_data_frame(&chunk) {
@@ -433,15 +429,19 @@ pub(crate) fn build_direct_execution_frame_stream(
             }
         }
         }
+        let diagnostics = stream_completion.diagnostic_snapshot();
+        let confirmed_end = terminal_error_category.is_none()
+            && !prefetched_body_failed
+            && diagnostics.body_read_error.is_none()
+            && stream_completion.successful_completion();
         let summary = finalize_stream_terminal_summary(
             &mut stream_terminal_observer,
             &normalized_observer_context,
             private_stream_normalizer.as_mut(),
-            &mut observer_buffered,
+            confirmed_end,
         );
 
         let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        let diagnostics = stream_completion.diagnostic_snapshot();
         log_direct_stream_diagnostics(
             "direct_frame_pump",
             None,
@@ -843,20 +843,15 @@ fn observe_stream_chunk(
     observer: &mut StreamingStandardTerminalObserver,
     report_context: &Value,
     private_stream_normalizer: Option<&mut crate::ai_serving::ProviderPrivateStreamNormalizer<'_>>,
-    observer_buffered: &mut Vec<u8>,
     chunk: &[u8],
 ) {
     if let Some(normalizer) = private_stream_normalizer {
-        let normalized = match normalizer.push_chunk(chunk) {
-            Ok(normalized) => normalized,
-            Err(_err) => {
-                observer.disable_with_error("provider stream normalization failed");
-                return;
-            }
-        };
-        observe_normalized_bytes(observer, report_context, observer_buffered, &normalized);
+        match normalizer.push_chunk(chunk) {
+            Ok(normalized) => observer.push_bytes(report_context, &normalized),
+            Err(_err) => observer.disable_with_error("provider stream normalization failed"),
+        }
     } else {
-        observe_normalized_bytes(observer, report_context, observer_buffered, chunk);
+        observer.push_bytes(report_context, chunk);
     }
 }
 
@@ -864,72 +859,20 @@ fn finalize_stream_terminal_summary(
     observer: &mut StreamingStandardTerminalObserver,
     report_context: &Value,
     private_stream_normalizer: Option<&mut crate::ai_serving::ProviderPrivateStreamNormalizer<'_>>,
-    observer_buffered: &mut Vec<u8>,
+    confirmed_end: bool,
 ) -> Option<ExecutionStreamTerminalSummary> {
     if let Some(normalizer) = private_stream_normalizer {
         match normalizer.finish() {
-            Ok(flushed) => {
-                observe_normalized_bytes(observer, report_context, observer_buffered, &flushed)
-            }
+            Ok(flushed) => observer.push_bytes(report_context, &flushed),
             Err(_err) => observer.disable_with_error("provider stream normalization failed"),
         }
     }
 
-    if !observer_buffered.is_empty() {
-        let line = std::mem::take(observer_buffered);
-        if let Err(_err) = observer.push_line(report_context, line) {
-            observer.disable_with_error("stream usage parsing failed");
-        }
-    }
-
-    match observer.finish(report_context) {
+    match observer.finish_with_confirmed_end(report_context, confirmed_end) {
         Ok(summary) => summary,
         Err(_err) => {
             observer.disable_with_error("stream usage parsing failed");
             observer.latest_summary().cloned()
-        }
-    }
-}
-
-fn observe_normalized_bytes(
-    observer: &mut StreamingStandardTerminalObserver,
-    report_context: &Value,
-    observer_buffered: &mut Vec<u8>,
-    normalized: &[u8],
-) {
-    if normalized.is_empty()
-        || observer
-            .latest_summary()
-            .and_then(|summary| summary.parser_error.as_deref())
-            .is_some()
-    {
-        return;
-    }
-
-    let mut remaining = normalized;
-    while !remaining.is_empty() {
-        let line_part_len = remaining
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(remaining.len(), |index| index + 1);
-        if observer_buffered.len().saturating_add(line_part_len)
-            > STREAM_USAGE_OBSERVER_MAX_LINE_BYTES
-        {
-            observer.disable_with_error(format!(
-                "stream usage event exceeded {STREAM_USAGE_OBSERVER_MAX_LINE_BYTES} bytes"
-            ));
-            observer_buffered.clear();
-            return;
-        }
-        observer_buffered.extend_from_slice(&remaining[..line_part_len]);
-        remaining = &remaining[line_part_len..];
-        if observer_buffered.last() == Some(&b'\n') {
-            let line = std::mem::take(observer_buffered);
-            if let Err(_err) = observer.push_line(report_context, line) {
-                observer.disable_with_error("stream usage parsing failed");
-                observer_buffered.clear();
-                return;
-            }
         }
     }
 }
@@ -957,9 +900,9 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        build_direct_execution_frame_stream, encode_error_frame, observe_normalized_bytes,
-        should_buffer_non_stream_response, should_treat_upstream_response_as_stream,
-        BRIDGED_CLIENT_SSE_MARKER_HEADER, STREAM_USAGE_OBSERVER_MAX_LINE_BYTES,
+        build_direct_execution_frame_stream, encode_error_frame, finalize_stream_terminal_summary,
+        observe_stream_chunk, should_buffer_non_stream_response,
+        should_treat_upstream_response_as_stream, BRIDGED_CLIENT_SSE_MARKER_HEADER,
         UPSTREAM_STREAM_READ_ERROR_MESSAGE,
     };
     use crate::ai_serving::api::StreamingStandardTerminalObserver;
@@ -1106,24 +1049,103 @@ mod tests {
     }
 
     #[test]
-    fn oversized_usage_line_disables_observation_without_retaining_the_line() {
+    fn oversized_usage_line_preserves_subsequent_terminal_observation() {
         let mut observer = StreamingStandardTerminalObserver::default();
         let report_context = serde_json::json!({
-            "provider_api_format": "claude:messages",
-            "client_api_format": "claude:messages",
+            "provider_api_format": "openai:chat",
+            "client_api_format": "openai:chat",
         });
-        let mut buffered = Vec::new();
-        let oversized = vec![b'x'; STREAM_USAGE_OBSERVER_MAX_LINE_BYTES + 1];
+        let oversized = vec![b'x'; 1024 * 1024 + 1];
+        observe_stream_chunk(&mut observer, &report_context, None, &oversized);
+        observe_stream_chunk(
+            &mut observer,
+            &report_context,
+            None,
+            b"tail\n\ndata: {\"id\":\"after-oversize\",\"object\":\"chat.completion.chunk\",\"model\":\"example\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let summary =
+            finalize_stream_terminal_summary(&mut observer, &report_context, None, false).unwrap();
+        assert!(summary.observation_error.is_some());
+        assert!(summary.parser_error.is_none());
+        assert!(summary.observed_finish);
+        assert_eq!(summary.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(summary.response_id.as_deref(), Some("after-oversize"));
+    }
 
-        observe_normalized_bytes(&mut observer, &report_context, &mut buffered, &oversized);
+    #[test]
+    fn observation_gap_requires_successful_completion_and_preserves_provider_failure() {
+        let report_context = serde_json::json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:responses",
+        });
+        let oversized = format!("data: {}\n\n", "x".repeat(1024 * 1024 + 1));
 
-        assert!(buffered.is_empty());
-        assert!(observer
-            .latest_summary()
-            .and_then(|summary| summary.parser_error.as_deref())
-            .is_some_and(|error| error.contains("stream usage event exceeded")));
-        observe_normalized_bytes(&mut observer, &report_context, &mut buffered, b"ignored");
-        assert!(buffered.is_empty());
+        let mut failed_tracker = ClientVisibleStreamCompletionTracker::default();
+        let mut failed_observer = StreamingStandardTerminalObserver::default();
+        failed_tracker.observe_chunk(oversized.as_bytes());
+        observe_stream_chunk(
+            &mut failed_observer,
+            &report_context,
+            None,
+            oversized.as_bytes(),
+        );
+        let failed_event = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"upstream failed\"}}}\n\n";
+        assert!(failed_tracker.observe_chunk(failed_event));
+        assert!(!failed_tracker.successful_completion());
+        observe_stream_chunk(&mut failed_observer, &report_context, None, failed_event);
+        let failed_summary = finalize_stream_terminal_summary(
+            &mut failed_observer,
+            &report_context,
+            None,
+            failed_tracker.successful_completion(),
+        )
+        .unwrap();
+        assert!(failed_summary.observation_error.is_some());
+        assert!(failed_summary
+            .parser_error
+            .as_deref()
+            .is_some_and(|err| err.contains("upstream failed")));
+
+        let mut unconfirmed_observer = StreamingStandardTerminalObserver::default();
+        observe_stream_chunk(
+            &mut unconfirmed_observer,
+            &report_context,
+            None,
+            oversized.as_bytes(),
+        );
+        let unconfirmed_summary = finalize_stream_terminal_summary(
+            &mut unconfirmed_observer,
+            &report_context,
+            None,
+            failed_tracker.successful_completion(),
+        )
+        .unwrap();
+        assert!(unconfirmed_summary.observation_error.is_some());
+        assert!(!unconfirmed_summary.observed_finish);
+        assert!(unconfirmed_summary.parser_error.is_some());
+
+        let mut ok_tracker = ClientVisibleStreamCompletionTracker::default();
+        let mut ok_observer = StreamingStandardTerminalObserver::default();
+        ok_tracker.observe_chunk(oversized.as_bytes());
+        observe_stream_chunk(
+            &mut ok_observer,
+            &report_context,
+            None,
+            oversized.as_bytes(),
+        );
+        let completed_event = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+        assert!(ok_tracker.observe_chunk(completed_event));
+        assert!(ok_tracker.successful_completion());
+        let ok_summary = finalize_stream_terminal_summary(
+            &mut ok_observer,
+            &report_context,
+            None,
+            ok_tracker.successful_completion(),
+        )
+        .unwrap();
+        assert!(ok_summary.observation_error.is_some());
+        assert!(ok_summary.observed_finish);
+        assert!(ok_summary.parser_error.is_none());
     }
 
     #[tokio::test]

@@ -20,7 +20,9 @@ use crate::formats::openai::image::{
 use crate::formats::openai::responses::history::{
     record_converted_response_history, ResponseHistoryRecord,
 };
-use crate::formats::shared::sse::{encode_done_sse, encode_json_sse};
+use crate::formats::shared::sse::{
+    captured_sse_records, encode_done_sse, encode_json_sse, SseRecord,
+};
 use crate::formats::shared::stream_core::common::{
     build_openai_chat_chunk, build_openai_chat_finish_chunk,
     build_openai_chat_usage_chunk_with_cache,
@@ -566,7 +568,7 @@ fn openai_image_terminal_summary(
         provider_actual_service_tier: None,
         observed_finish: true,
         unknown_event_count: 0,
-        parser_error: None,
+        ..ExecutionStreamTerminalSummary::default()
     }
 }
 
@@ -872,10 +874,9 @@ fn rewrite_sse_body_between_formats(
 
     let mut matrix = StreamingStandardFormatMatrix::default();
     let mut out = Vec::new();
-    for_each_sse_line(body, |line| {
+    for line in captured_sse_records(body).filter_map(SseRecord::into_data_line) {
         out.extend(matrix.transform_line(&context, line)?);
-        Ok(())
-    })?;
+    }
     out.extend(matrix.finish(&context)?);
     Ok(out)
 }
@@ -898,25 +899,8 @@ fn observe_sse_terminal_summary(
     }
 
     let mut observer = StreamingStandardTerminalObserver::default();
-    for_each_sse_line(body, |line| observer.push_line(&context, line))?;
+    observer.push_bytes(&context, body);
     observer.finish(&context)
-}
-
-fn for_each_sse_line<F>(body: &[u8], mut on_line: F) -> Result<(), AiSurfaceFinalizeError>
-where
-    F: FnMut(Vec<u8>) -> Result<(), AiSurfaceFinalizeError>,
-{
-    let mut start = 0usize;
-    for (index, byte) in body.iter().enumerate() {
-        if *byte == b'\n' {
-            on_line(body[start..=index].to_vec())?;
-            start = index + 1;
-        }
-    }
-    if start < body.len() {
-        on_line(body[start..].to_vec())?;
-    }
-    Ok(())
 }
 
 fn extract_openai_image_sync_b64_json(item: &serde_json::Map<String, Value>) -> Option<String> {
@@ -1293,7 +1277,7 @@ fn build_terminal_summary_from_openai_responses_response(
         provider_actual_service_tier,
         observed_finish: true,
         unknown_event_count: 0,
-        parser_error: None,
+        ..ExecutionStreamTerminalSummary::default()
     })
 }
 
@@ -2177,9 +2161,11 @@ mod tests {
             "event: content_block_start\n",
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"Edit\",\"input\":{}}}\n\n",
             "event: content_block_delta\n",
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"/tmp/a.txt\\\"}\"}}\n\n",
+            "data: {\"index\":0,\r\n",
+            "data: \"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"/tmp/a.txt\\\"}\"}}\r\n\r\n",
             "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n",
+            "data: {\"delta\":{\"stop_reason\":\"tool_use\"},\n",
+            "data: \"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\n",
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         );
@@ -2204,5 +2190,11 @@ mod tests {
         assert!(output.contains("event: response.function_call_arguments.delta"));
         assert!(output.contains("event: response.completed"));
         assert!(!output.contains("status_code"));
+        let usage = outcome
+            .terminal_summary
+            .unwrap()
+            .standardized_usage
+            .unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (1, 2));
     }
 }

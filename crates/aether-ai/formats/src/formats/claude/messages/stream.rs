@@ -20,6 +20,7 @@ struct ClaudeProviderToolState {
 
 #[derive(Default)]
 pub struct ClaudeProviderState {
+    pub(crate) observed_end: bool,
     message_id: Option<String>,
     model: Option<String>,
     started: bool,
@@ -351,6 +352,15 @@ impl ClaudeProviderState {
                 let Some(delta) = event_object.get("delta").and_then(Value::as_object) else {
                     return Ok(out);
                 };
+                if !delta
+                    .get("stop_reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| !reason.is_empty())
+                {
+                    self.merge_usage(canonical_usage_from_claude_usage(event_object.get("usage")));
+                    return Ok(out);
+                }
+                self.observed_end = true;
                 let finish_reason = map_claude_stop_reason(
                     delta.get("stop_reason").and_then(Value::as_str),
                     delta.get("stop_reason").and_then(Value::as_str) == Some("tool_use"),
@@ -383,7 +393,8 @@ impl ClaudeProviderState {
                     });
                 }
             }
-            "message_stop" | "ping" => {}
+            "message_stop" => self.observed_end = true,
+            "ping" => {}
             _ => {
                 out.push(self.unknown_frame(report_context, value.clone()));
             }
@@ -405,7 +416,7 @@ impl ClaudeProviderState {
             model,
             event: CanonicalStreamEvent::Finish {
                 finish_reason: None,
-                usage: None,
+                usage: self.usage.take(),
             },
         }])
     }
@@ -1607,6 +1618,40 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn claude_usage_only_delta_waits_for_message_stop_and_keeps_tokens() {
+        let mut state = ClaudeProviderState::default();
+        let context = json!({});
+        let frames = state
+            .push_line(
+                &context,
+                data_line(json!({
+                    "type": "message_delta", "delta": {}, "usage": {"output_tokens": 7}
+                })),
+            )
+            .unwrap();
+        assert!(!frames
+            .iter()
+            .any(|f| matches!(f.event, CanonicalStreamEvent::Finish { .. })));
+        state
+            .push_line(&context, data_line(json!({"type":"message_stop"})))
+            .unwrap();
+        let frames = state.finish(&context).unwrap();
+        assert!(matches!(
+            frames.as_slice(),
+            [CanonicalStreamFrame {
+                event: CanonicalStreamEvent::Finish {
+                    usage: Some(CanonicalUsage {
+                        output_tokens: 7,
+                        ..
+                    }),
+                    ..
+                },
+                ..
+            }]
+        ));
     }
 
     #[test]

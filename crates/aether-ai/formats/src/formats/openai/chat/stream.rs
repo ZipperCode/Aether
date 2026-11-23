@@ -101,6 +101,7 @@ struct OpenAIChatProviderToolState {
 
 #[derive(Default)]
 pub struct OpenAIChatProviderState {
+    pub(crate) observed_end: bool,
     terminal_only: bool,
     response_id: Option<String>,
     model: Option<String>,
@@ -238,6 +239,13 @@ impl OpenAIChatProviderState {
         line: Vec<u8>,
     ) -> Result<Vec<CanonicalStreamFrame>, AiSurfaceFinalizeError> {
         let Some(value) = decode_json_data_line(&line) else {
+            if line
+                .trim_ascii()
+                .strip_prefix(b"data:")
+                .is_some_and(|data| data.trim_ascii() == b"[DONE]")
+            {
+                self.observed_end = true;
+            }
             return Ok(Vec::new());
         };
         let Some(chunk_object) = value.as_object() else {
@@ -263,6 +271,11 @@ impl OpenAIChatProviderState {
         }
 
         let mut out = Vec::new();
+        if openai_stream_payload_is_terminal_error(&value) {
+            self.observed_end = true;
+            out.push(self.unknown_frame(report_context, value));
+            return Ok(out);
+        }
         let Some(chunk_choices) = chunk_object.get("choices").and_then(Value::as_array) else {
             if let Some(usage) = Self::finish_usage(chunk_object.get("usage")) {
                 self.ensure_started(report_context, &mut out);
@@ -311,12 +324,16 @@ impl OpenAIChatProviderState {
                 continue;
             };
             let finish_reason_key_present = choice_object.contains_key("finish_reason");
+            self.observed_end |= choice_object
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.trim().is_empty());
             let Some(delta) = choice_object.get("delta").and_then(Value::as_object) else {
                 if let Some(finish_reason) = normalize_openai_finish_reason(
                     choice_object.get("finish_reason").and_then(Value::as_str),
                 ) {
+                    self.ensure_started(report_context, &mut out);
                     if let Some(usage) = Self::finish_usage(chunk_object.get("usage")) {
-                        self.ensure_started(report_context, &mut out);
                         let (id, model) = self.identity(report_context);
                         out.push(CanonicalStreamFrame {
                             id,
@@ -475,8 +492,8 @@ impl OpenAIChatProviderState {
                 choice_object.get("finish_reason").and_then(Value::as_str),
             ) {
                 recognized_delta = true;
+                self.ensure_started(report_context, &mut out);
                 if let Some(usage) = Self::finish_usage(chunk_object.get("usage")) {
-                    self.ensure_started(report_context, &mut out);
                     let (id, model) = self.identity(report_context);
                     self.flush_unstarted_tool_calls(&id, &model, &mut out);
                     out.push(CanonicalStreamFrame {
@@ -563,6 +580,10 @@ impl OpenAIChatProviderState {
 }
 
 impl OpenAIResponsesProviderState {
+    pub(crate) fn observed_end(&self) -> bool {
+        self.finished
+    }
+
     pub(crate) fn terminal_observation() -> Self {
         Self {
             terminal_only: true,
